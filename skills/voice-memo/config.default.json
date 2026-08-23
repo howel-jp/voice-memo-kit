@@ -1,0 +1,22 @@
+{
+  "paths": {
+    "inbox": "voice_memos/inbox",
+    "transcripts": "voice_memos/transcripts",
+    "processed": "voice_memos/processed",
+    "glossary_candidates": ["voice_memos/glossary", "tools/glossary"]
+  },
+  "whisper": {
+    "model": "large-v3",
+    "compute_type": "int8",
+    "language": "ja",
+    "batch_size": 8,
+    "chunk_size": 30
+  },
+  "formatting": {
+    "paragraph_gap_sec": 1.5
+  },
+  "proofread": {
+    "enabled": true,
+    "model": "claude-sonnet-4-6"
+  }
+}
