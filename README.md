@@ -49,19 +49,26 @@ New-Item -ItemType Junction -Path "$env:USERPROFILE\.claude\skills\voice-memo" -
 
 これで Claude Code のどのプロジェクトでも `/voice-memo` が使える。更新は `git pull` のみ。
 
-## プロジェクト側の準備
+## 置き場（2 層構造）
 
 ```
-<project>/voice_memos/
-├── inbox/        # 文字起こししたい音声を置く（git 管理外）
-├── transcripts/  # 出力（git 管理外）
+<project>/voice_memos/          # プロジェクト層（カレントディレクトリ直下）
+├── inbox/        # このプロジェクト向けの音声（git 管理外）
+├── transcripts/  # 出力先。グローバル層の音声の transcript もここに出る（git 管理外）
 ├── processed/    # 処理済み音声の退避先（git 管理外）
-├── glossary/     # 任意: 固有名詞辞書 *.json（共有してよい）
+├── glossary/     # 任意: プロジェクト固有の辞書 *.json（共有してよい）
 └── config.json   # 任意: 既定設定の上書き
+
+~/voice_memos/                  # グローバル層（PC 全体で共有、config の global_root）
+├── inbox/        # どのプロジェクトにも属さない音声（スマホ同期の着地点など）
+├── processed/
+└── glossary/     # PC 共通の辞書（人名・常用語）
 ```
 
-辞書の探索順は `voice_memos/glossary/` → `tools/glossary/`（無ければ辞書なしで動く）。
-`config.json` は `config.default.json` と同じキーの部分上書き（例: `{"paths": {"glossary": "tools/glossary"}}`）。
+- 音声: プロジェクト inbox → グローバル inbox の順に**両方**処理（プロジェクト優先）。`--no-global` で無視
+- 辞書: グローバル＋プロジェクトをマージ。同じ canonical はプロジェクト側が優先し、wrong_variants は和集合
+- プロジェクト辞書の探索順は `voice_memos/glossary/` → `tools/glossary/`（無ければプロジェクト辞書なし）
+- `config.json` は `config.default.json` と同じキーの部分上書き（例: `{"paths": {"glossary": "tools/glossary"}}`、`{"global_root": "D:/memos"}`）
 
 辞書 JSON の書式:
 
@@ -80,7 +87,7 @@ New-Item -ItemType Junction -Path "$env:USERPROFILE\.claude\skills\voice-memo" -
 # プロジェクトルートで
 & "$env:USERPROFILE\.claude\skills\voice-memo\transcribe.ps1"            # inbox を全部処理
 & "$env:USERPROFILE\.claude\skills\voice-memo\transcribe.ps1" "memo.m4a" # 指定ファイル
-# オプション: --timestamps / --no-glossary / --no-proofread / --keep / --device cpu / --project <dir>
+# オプション: --timestamps / --no-glossary / --no-global / --no-proofread / --keep / --device cpu / --project <dir>
 ```
 
 Claude Code では `/voice-memo` を打てば、文字起こしから内容の解釈まで一連で行う。

@@ -15,24 +15,29 @@ description: 音声ファイル（ボイスメモ）をローカル WhisperX で
 **スコープ**: 対象音声の決定 → 文字起こし実行 → transcript 読込 → 内容の理解確認 → そこから会話/作業の開始。
 voice_memos の中身はローカル限定（git 管理外が原則）なので、本 Skill は記録・commit を目的としない。
 
-## 0. 前提（プロジェクト側）
+## 0. 前提（2 層構造）
 
-- カレントディレクトリ（プロジェクトルート）直下に `voice_memos/inbox/` がある（無ければ作る）
-- 固有名詞辞書（任意）: `voice_memos/glossary/*.json`。無ければ `tools/glossary/` を探し、それも無ければ辞書なしで動く
-- 設定の上書き（任意）: `voice_memos/config.json`
+| 層 | 場所 | 役割 |
+|---|---|---|
+| プロジェクト層 | カレントディレクトリ直下 `voice_memos/` | `inbox/`（このプロジェクト向けの音声）、`transcripts/`（出力先）、`processed/`、`glossary/`（プロジェクト固有の辞書）、`config.json`（任意の設定上書き） |
+| グローバル層 | `~/voice_memos/` | `inbox/`（どのプロジェクトにも属さない音声）、`processed/`、`glossary/`（PC 共通の辞書） |
+
+- 音声は **プロジェクト inbox → グローバル inbox の順に両方**処理される（プロジェクト優先）。transcript は常にプロジェクト層の `transcripts/` に出る
+- 辞書はグローバルとプロジェクトを**マージ**（同じ canonical はプロジェクト側が優先）。プロジェクト側は `voice_memos/glossary/` が無ければ `tools/glossary/` を探す
+- `--no-global` でグローバル層を無視できる
 
 ## 1. 対象音声を決める
 
 - **引数あり**（音声ファイル/フォルダのパス）: それを対象にする。
-- **引数なし**: `voice_memos/inbox/` 内の音声すべてを対象にする。
+- **引数なし**: プロジェクト `voice_memos/inbox/` とグローバル `~/voice_memos/inbox/` の音声すべてを対象にする。
 
-実行前に inbox の中身を確認（処理対象の把握 + 後で新規 transcript を特定するため）:
+実行前に両 inbox の中身を確認（処理対象の把握 + 後で新規 transcript を特定するため）:
 
 ```powershell
-Get-ChildItem voice_memos\inbox -File | Where-Object { $_.Extension -in '.mp3','.m4a','.wav','.aac','.flac','.ogg','.mp4' } | Select-Object Name
+Get-ChildItem voice_memos\inbox, "$env:USERPROFILE\voice_memos\inbox" -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in '.mp3','.m4a','.wav','.aac','.flac','.ogg','.mp4' } | Select-Object Directory, Name
 ```
 
-対象が無ければ「`voice_memos/inbox/` に音声を置いてください（または音声パスを指定）」と案内して終了。
+対象が無ければ「`voice_memos/inbox/`（プロジェクト）または `~/voice_memos/inbox/`（共通）に音声を置いてください（または音声パスを指定）」と案内して終了。
 
 ## 2. 文字起こし＋校閲を実行
 
@@ -80,8 +85,9 @@ Get-ChildItem voice_memos\inbox -File | Where-Object { $_.Extension -in '.mp3','
 
 - 音声認識・校閲は完璧ではない。**固有名詞・数値・聞き取りにくい箇所**は誤りうる。意味が通らない箇所や
   重要語が怪しいときは、断定せず「ここはこう言った？」と確認する（誤解で進めない）。判断に効く所ほど慎重に。
-- 固有名詞が繰り返し誤変換される場合は、プロジェクトの辞書（`voice_memos/glossary/*.json`）に
-  `wrong_variants → canonical` の追記を**提案**する（canonical の確定はユーザーの領分）。
+- 固有名詞が繰り返し誤変換される場合は、辞書に `wrong_variants → canonical` の追記を**提案**する
+  （canonical の確定はユーザーの領分）。置き場所は、そのプロジェクト固有の語なら `voice_memos/glossary/*.json`、
+  人名など PC 全体で使う語なら `~/voice_memos/glossary/*.json`。
   wrong_variants は実際に観測された誤認識のみ追加する（仮想的な誤りは過剰置換のリスク）。
 - どうしても聞き取れない箇所は `<details>` の校閲前データも見て突き合わせる。それでも不明ならユーザーに確認。
 

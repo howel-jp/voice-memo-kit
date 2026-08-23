@@ -1,9 +1,15 @@
 {
+  "global_root": "~/voice_memos",
   "paths": {
     "inbox": "voice_memos/inbox",
     "transcripts": "voice_memos/transcripts",
     "processed": "voice_memos/processed",
     "glossary_candidates": ["voice_memos/glossary", "tools/glossary"]
+  },
+  "global_paths": {
+    "inbox": "inbox",
+    "processed": "processed",
+    "glossary": "glossary"
   },
   "whisper": {
     "model": "large-v3",

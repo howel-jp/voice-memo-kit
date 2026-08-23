@@ -36,6 +36,33 @@ def load_glossary(glossary_dir: Path | None) -> list[dict]:
     return entries
 
 
+def merge_glossaries(*layers: list[dict]) -> list[dict]:
+    """複数層の辞書をマージする。後の層ほど優先（同じ canonical は後勝ち、wrong_variants は和集合）。
+
+    典型: merge_glossaries(global_entries, project_entries)
+    """
+    merged: dict[str, dict] = {}
+    order: list[str] = []
+    for layer in layers:
+        for entry in layer:
+            canonical = entry.get("canonical")
+            if not canonical:
+                continue
+            if canonical in merged:
+                prev = merged[canonical]
+                variants = list(prev.get("wrong_variants", []) or [])
+                for v in entry.get("wrong_variants", []) or []:
+                    if v and v not in variants:
+                        variants.append(v)
+                new = dict(entry)
+                new["wrong_variants"] = variants
+                merged[canonical] = new
+            else:
+                merged[canonical] = dict(entry)
+                order.append(canonical)
+    return [merged[c] for c in order]
+
+
 def build_initial_prompt(entries: list[dict]) -> str:
     """WhisperX の initial_prompt 用文字列を組み立てる。
 
