@@ -107,6 +107,26 @@ Claude が `setup.ps1` の実行を案内する。手動で行う場合:
 `-DataDir` を省略しても、ランチャーは `VOICE_MEMO_PYTHON` → `~/.claude/plugins/data/*voice-memo-kit*/.venv` → `<plugin-root>/.venv` の順に venv を探す。
 Claude Code では `/voice-memo` を打てば、文字起こしから内容の解釈まで一連で行う。
 
+## 開発
+
+```powershell
+# ユニットテスト（GPU・WhisperX 不要。純粋関数と、whisperx / Claude CLI をスタブ化したロジックを検証）
+python -m unittest discover -s tests
+```
+
+性能の目安（RTX 3060 Ti、large-v3 int8、273 秒の音声、2026-08-25 実測）:
+
+| 段階 | 所要 |
+|---|---|
+| torch + whisperx の import | 約 2.4 秒 |
+| モデル読込（プロセス内で 1 回だけ。複数ファイルでは使い回す） | 約 15 秒 |
+| 推論（VAD 含む） | 約 7〜8 秒 ＝ 実時間の 35〜40 倍 |
+| Claude 校閲（1,000 字） | 約 15 秒 |
+
+推論は GPU で走っており（CPU なら数分）、体感の待ち時間はモデル読込と校閲が主因。`float16` にしても推論は 7% 程度しか縮まらないため既定は `int8` のまま。
+
+安全ガード: 校閲結果が入力の 60% 未満の長さになった場合は「要約・欠落の疑い」として棄却し、生の文字起こしを採用する（frontmatter の `proofread: false` で判別できる）。
+
 ## ロードマップ
 
 - **現在**: 個人スキル（ジャンクション）方式で運用

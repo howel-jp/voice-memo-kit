@@ -128,15 +128,26 @@ def _strip_wrapping(text: str) -> str:
     return t
 
 
+class ProofreadRejected(RuntimeError):
+    """校閲結果が安全基準を満たさない（要約・大幅な欠落の疑い）ときに送出。呼び出し側は生本文にフォールバックする。"""
+
+
+# 校閲後の文字数が入力のこの割合を下回ったら「要約・欠落の疑い」として棄却する。
+# レベルB（フィラー除去＋軽い整え）なら 2〜3 割減が上限の目安。
+MIN_LENGTH_RATIO = 0.6
+
+
 def proofread_body(
     body: str,
     canonicals: list[str],
     *,
     model: str = "claude-sonnet-4-6",
+    min_length_ratio: float = MIN_LENGTH_RATIO,
 ) -> str:
     """本文を Claude で校閲して校閲後テキストを返す。
 
     呼び出し側は例外を捕捉し、失敗時は元の body を使う（文字起こしは失わない）。
+    校閲後が短すぎる場合は ProofreadRejected を送出する（意味を変えない規律の機械的なガード）。
     """
     if not body.strip():
         return body
@@ -151,4 +162,12 @@ def proofread_body(
     )
     result = _call_claude(system_prompt, user_message, model)
     cleaned = _strip_wrapping(result)
-    return cleaned or body
+    if not cleaned:
+        return body
+    ratio = len(cleaned) / max(1, len(body))
+    if ratio < min_length_ratio:
+        raise ProofreadRejected(
+            f"校閲後が短すぎます（{len(cleaned)}/{len(body)} 文字 = {ratio:.0%}、下限 {min_length_ratio:.0%}）。"
+            "要約・欠落の疑いがあるため生の文字起こしを使います"
+        )
+    return cleaned
