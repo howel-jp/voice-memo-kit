@@ -112,6 +112,9 @@ Claude Code では `/voice-memo` を打てば、文字起こしから内容の�
 ```powershell
 # ユニットテスト（GPU・WhisperX 不要。純粋関数と、whisperx / Claude CLI をスタブ化したロジックを検証）
 python -m unittest discover -s tests
+
+# ランチャーの引数受け渡しテスト（Python を echo スタブに差し替え。--flags / 位置引数 / -DataDir の分離を検証）
+powershell -NoProfile -File tests\test_launcher.ps1
 ```
 
 性能の目安（RTX 3060 Ti、large-v3 int8、273 秒の音声、2026-08-25 実測）:
