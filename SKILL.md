@@ -41,21 +41,38 @@ Get-ChildItem voice_memos\inbox, "$env:USERPROFILE\voice_memos\inbox" -File -Err
 
 ## 2. 文字起こし＋校閲を実行
 
-ランチャーは**このスキルのベースディレクトリ**にある `transcribe.ps1`（スキル読込時に示されるパス）。
+ランチャーはプラグインルートの `transcribe.ps1`。プラグインルートは `${CLAUDE_PLUGIN_ROOT}`、
+更新をまたいで保持されるデータ置き場（venv）は `${CLAUDE_PLUGIN_DATA}`。
 プロジェクトルートをカレントにして実行する:
 
 ```powershell
 # inbox の音声を全部処理（既定で glossary 補正 + Claude 文脈校閲つき）
-& "<このスキルのベースディレクトリ>\transcribe.ps1"
+& "${CLAUDE_PLUGIN_ROOT}\transcribe.ps1" -DataDir "${CLAUDE_PLUGIN_DATA}" | Out-String
 
 # 引数で特定ファイルを指定する場合
-& "<このスキルのベースディレクトリ>\transcribe.ps1" "<音声パス>"
+& "${CLAUDE_PLUGIN_ROOT}\transcribe.ps1" -DataDir "${CLAUDE_PLUGIN_DATA}" "<音声パス>" | Out-String
 ```
 
-- 出力は `voice_memos/transcripts/<録音日>_<元ファイル名>.md`、音声は `voice_memos/processed/` へ自動退避。
+- 出力は `voice_memos/transcripts/<録音日>_<元ファイル名>.md`、音声は見つかった層の `processed/` へ自動退避。
 - **注意**: `2>&1 | Select-String` 等で stderr を混ぜると、ライブラリ警告が終了エラー扱いされ途中中断する
   ことがある。**素直にそのまま実行**するか、出力を `| Out-String` で受ける。成否は終了コードと transcript 生成有無で判断する。
 - 文字起こし自体が失敗した場合（GPU 不調等）は `--device cpu` を案内、またはユーザーに状況を伝える。
+- 上のパス変数が展開されず `${CLAUDE_PLUGIN_ROOT}` のまま見える場合（プラグインではなく個人スキルとして読み込まれている）は、
+  スキル読込時に示されたベースディレクトリを使い、`-DataDir` は付けない。
+
+### 初回セットアップ（venv が無いとき）
+
+ランチャーが **exit 2**（`Python venv not found`）を返したら、venv が未構築。ユーザーに次の 2 択を確認してから `setup.ps1` を実行する:
+
+```powershell
+# a) 既に WhisperX 入りの venv があるなら、それにリンクする（ダウンロードなし）
+& "${CLAUDE_PLUGIN_ROOT}\setup.ps1" -DataDir "${CLAUDE_PLUGIN_DATA}" -LinkTo "<既存 venv のパス>"
+
+# b) 新規構築（Python 3.10・NVIDIA GPU・ffmpeg が前提。約 7GB をダウンロード）
+& "${CLAUDE_PLUGIN_ROOT}\setup.ps1" -DataDir "${CLAUDE_PLUGIN_DATA}"
+```
+
+`setup OK` が出たら §2 の実行に戻る。
 
 ## 3. 生成された transcript を読む
 
@@ -94,6 +111,6 @@ Get-ChildItem voice_memos\inbox, "$env:USERPROFILE\voice_memos\inbox" -File -Err
 ## 失敗時のフォールバック
 
 - inbox 空 & 引数なし → 音声の配置/パス指定を案内して終了。
-- venv が見つからない → キットの README（セットアップ）を案内。
+- venv が見つからない（exit 2） → §2「初回セットアップ」の手順で `setup.ps1` を実行。
 - 校閲（Claude CLI）だけ失敗 → ツールは生の文字起こしを保持してフォールバックするので、本文（校閲前）で続行。
 - 文字起こし内容が空/ノイズのみ → その旨を伝え、録り直しを提案。

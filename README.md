@@ -9,45 +9,52 @@
 - 校閲: Claude Code CLI（サブスクリプション容量内・追加課金なし）。校閲前データも md 内に保持
 - 出力: `<project>/voice_memos/transcripts/<録音日>_<元ファイル名>.md`
 
-## 構成
+## 構成（Claude Code プラグイン・単一スキル構成）
 
 ```
-voice-memo-kit/
-├── skills/voice-memo/        # Claude Code スキル（この単位をプロジェクトに共有する）
-│   ├── SKILL.md              # 手順: 文字起こし → 読込 → 「口述された入力」として解釈
-│   ├── transcribe.ps1        # ランチャー（キットの .venv を使う）
-│   ├── config.default.json   # 既定設定（パス・モデル・校閲）
-│   ├── scripts/              # transcribe.py / engine.py / glossary.py / proofread.py
-│   └── prompts/memo_proofread.md
-├── requirements.lock.txt     # venv 再現用（pip freeze 固定）
-└── .venv/                    # git 管理外。実 venv または既存 venv へのジャンクション
+voice-memo-kit/                 # = プラグインルート = スキルのベースディレクトリ
+├── .claude-plugin/plugin.json  # プラグインマニフェスト（name / version）
+├── SKILL.md                    # /voice-memo の手順: 文字起こし → 読込 → 「口述された入力」として解釈
+├── transcribe.ps1              # ランチャー（-DataDir <dir> で venv 置き場を指定）
+├── setup.ps1                   # venv 構築 or 既存 venv へのリンク
+├── config.default.json         # 既定設定（パス・モデル・校閲・グローバル層）
+├── scripts/                    # transcribe.py / engine.py / glossary.py / proofread.py
+├── prompts/memo_proofread.md   # Claude 校閲プロンプト（レベルB）
+└── requirements.lock.txt       # venv 再現用（pip freeze 固定）
 ```
 
-## セットアップ（1 回）
+スキルはプラグインルート直下の `SKILL.md` 1 つ（単一スキルプラグイン）なので、呼び出し名は名前空間なしの `/voice-memo`。
+**単一スキルプラグインの呼び出し名はインストール先ディレクトリ名で決まる**（検証済み）ため、プラグイン名を `voice-memo` にしている
+（リポジトリ名は `voice-memo-kit`、マーケットプレイス名は `howel-jp`）。
 
-### 1. venv
+## インストール
 
-WhisperX + CUDA の venv（約 7GB）。既に同等の venv があるならジャンクションで流用する:
+```shell
+/plugin marketplace add howel-jp/voice-memo-kit
+/plugin install voice-memo@howel-jp
+```
+
+更新: `/plugin marketplace update howel-jp` → `/plugin update voice-memo@howel-jp`（`plugin.json` の `version` が上がったときだけ配信される）。
+
+開発中・ローカル試験は `claude --plugin-dir C:\Projects\voice-memo-kit`、または
+`~/.claude/skills/voice-memo` をキットへのジャンクションにすると `voice-memo@skills-dir` として自動ロードされる
+（この方式では `${CLAUDE_PLUGIN_ROOT}` 等の変数は展開されないが、ランチャーのフォールバック探索で動く）。
+
+## セットアップ（venv、1 回）
+
+WhisperX + CUDA の Python 環境（約 7GB）が必要。初めて `/voice-memo` を実行するとランチャーが venv 不在（exit 2）を報告し、
+Claude が `setup.ps1` の実行を案内する。手動で行う場合:
 
 ```powershell
-# 既存 venv を流用（例）
-New-Item -ItemType Junction -Path .\.venv -Target "C:\path\to\existing\.venv"
+# a) 既存の WhisperX 入り venv にリンク（ダウンロードなし）
+& "<plugin-root>\setup.ps1" -DataDir "<CLAUDE_PLUGIN_DATA>" -LinkTo "C:\path\to\existing\.venv"
 
-# 新規に構築する場合（Python 3.10 / CUDA 12.6 wheel 前提）
-python -m venv .\.venv
-.\.venv\Scripts\python.exe -m pip install -r .\requirements.lock.txt
-.\.venv\Scripts\python.exe -c "import torch, whisperx; print(torch.cuda.is_available())"  # True
+# b) 新規構築（Python 3.10 / NVIDIA GPU / ffmpeg 前提）
+& "<plugin-root>\setup.ps1" -DataDir "<CLAUDE_PLUGIN_DATA>"
 ```
 
-環境変数 `VOICE_MEMO_PYTHON` で Python を明示指定することもできる。
-
-### 2. スキルを全プロジェクトに共有（個人スキル）
-
-```powershell
-New-Item -ItemType Junction -Path "$env:USERPROFILE\.claude\skills\voice-memo" -Target "C:\Projects\voice-memo-kit\skills\voice-memo"
-```
-
-これで Claude Code のどのプロジェクトでも `/voice-memo` が使える。更新は `git pull` のみ。
+`<CLAUDE_PLUGIN_DATA>` は `~/.claude/plugins/data/<plugin-id>/`（プラグイン更新をまたいで保持される）。
+`-DataDir` を省略するとプラグインルート直下の `.venv` を使う。環境変数 `VOICE_MEMO_PYTHON` で Python を直接指定することもできる。
 
 ## 置き場（2 層構造）
 
@@ -84,12 +91,13 @@ New-Item -ItemType Junction -Path "$env:USERPROFILE\.claude\skills\voice-memo" -
 ## 使い方
 
 ```powershell
-# プロジェクトルートで
-& "$env:USERPROFILE\.claude\skills\voice-memo\transcribe.ps1"            # inbox を全部処理
-& "$env:USERPROFILE\.claude\skills\voice-memo\transcribe.ps1" "memo.m4a" # 指定ファイル
+# プロジェクトルートで（<plugin-root> はプラグインのインストール先）
+& "<plugin-root>\transcribe.ps1" -DataDir "<CLAUDE_PLUGIN_DATA>"            # 両 inbox を全部処理
+& "<plugin-root>\transcribe.ps1" -DataDir "<CLAUDE_PLUGIN_DATA>" "memo.m4a" # 指定ファイル
 # オプション: --timestamps / --no-glossary / --no-global / --no-proofread / --keep / --device cpu / --project <dir>
 ```
 
+`-DataDir` を省略しても、ランチャーは `VOICE_MEMO_PYTHON` → `~/.claude/plugins/data/*voice-memo-kit*/.venv` → `<plugin-root>/.venv` の順に venv を探す。
 Claude Code では `/voice-memo` を打てば、文字起こしから内容の解釈まで一連で行う。
 
 ## ロードマップ

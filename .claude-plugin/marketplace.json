@@ -1,0 +1,19 @@
+{
+  "name": "howel-jp",
+  "owner": {
+    "name": "howel-jp",
+    "url": "https://github.com/howel-jp"
+  },
+  "description": "howel-jp の Claude Code プラグイン",
+  "plugins": [
+    {
+      "name": "voice-memo",
+      "source": "./",
+      "description": "ボイスメモをローカル WhisperX で文字起こし＋Claude 校閲し、口述の指示・思考として会話を始める /voice-memo スキル",
+      "version": "0.1.0",
+      "author": {
+        "name": "howel-jp"
+      }
+    }
+  ]
+}
