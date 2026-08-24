@@ -26,7 +26,7 @@ def load_glossary(glossary_dir: Path | None) -> list[dict]:
         return entries
     for json_file in sorted(glossary_dir.glob("*.json")):
         try:
-            data = json.loads(json_file.read_text(encoding="utf-8"))
+            data = json.loads(json_file.read_text(encoding="utf-8-sig"))  # BOM 許容
         except json.JSONDecodeError as e:
             print(f"[glossary] WARN: {json_file.name} のパース失敗: {e}")
             continue

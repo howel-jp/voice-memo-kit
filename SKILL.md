@@ -23,7 +23,7 @@ voice_memos の中身はローカル限定（git 管理外が原則）なので�
 | グローバル層 | `~/voice_memos/` | `inbox/`（どのプロジェクトにも属さない音声）、`processed/`、`glossary/`（PC 共通の辞書） |
 
 - 音声は **プロジェクト inbox → グローバル inbox の順に両方**処理される（プロジェクト優先）。transcript は常にプロジェクト層の `transcripts/` に出る
-- 辞書はグローバルとプロジェクトを**マージ**（同じ canonical はプロジェクト側が優先）。プロジェクト側は `voice_memos/glossary/` が無ければ `tools/glossary/` を探す
+- 辞書はグローバル → `extra_glossary_dirs`（`voice_memos/config.json` で明示追加したプロジェクト共有辞書、任意）→ プロジェクト `voice_memos/glossary/` の順に**マージ**（同じ canonical は後の層＝プロジェクトが優先）
 - `--no-global` でグローバル層を無視できる
 
 ## 1. 対象音声を決める

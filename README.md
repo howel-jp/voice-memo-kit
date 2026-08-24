@@ -76,9 +76,13 @@ Claude が `setup.ps1` の実行を案内する。手動で行う場合:
 ```
 
 - 音声: プロジェクト inbox → グローバル inbox の順に**両方**処理（プロジェクト優先）。`--no-global` で無視
-- 辞書: グローバル＋プロジェクトをマージ。同じ canonical はプロジェクト側が優先し、wrong_variants は和集合
-- プロジェクト辞書の探索順は `voice_memos/glossary/` → `tools/glossary/`（無ければプロジェクト辞書なし）
-- `config.json` は `config.default.json` と同じキーの部分上書き（例: `{"paths": {"glossary": "tools/glossary"}}`、`{"global_root": "D:/memos"}`）
+- 辞書: グローバル → `extra_glossary_dirs` → プロジェクト `voice_memos/glossary/` の順にマージ。同じ canonical は後の層（プロジェクト）が優先し、wrong_variants は和集合
+- **プロジェクト共有の辞書を足す**（チームで管理している用語集を、ボイスメモ以外の用途と共用するとき）:
+  ```json
+  { "paths": { "extra_glossary_dirs": ["glossary"] } }
+  ```
+  `voice_memos/config.json` に書く。パスはプロジェクトルート基準（絶対パスも可）。既定の `voice_memos/glossary/` は常に有効で、ここに列挙した辞書が**追加**される
+- `config.json` は `config.default.json` と同じキーの部分上書き（例: `{"global_root": "D:/memos"}`）
 
 辞書 JSON の書式:
 

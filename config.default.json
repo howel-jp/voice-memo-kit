@@ -4,7 +4,8 @@
     "inbox": "voice_memos/inbox",
     "transcripts": "voice_memos/transcripts",
     "processed": "voice_memos/processed",
-    "glossary_candidates": ["voice_memos/glossary", "tools/glossary"]
+    "glossary": "voice_memos/glossary",
+    "extra_glossary_dirs": []
   },
   "global_paths": {
     "inbox": "inbox",

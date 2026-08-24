@@ -16,8 +16,8 @@
 
 2 層構造（プロジェクト層 + グローバル層 ~/voice_memos）:
 - 音声: <project>/voice_memos/inbox → ~/voice_memos/inbox の順に両方を処理（プロジェクト優先）
-- 辞書: ~/voice_memos/glossary と <project>/voice_memos/glossary をマージ（同 canonical はプロジェクト優先。
-  プロジェクト側は paths.glossary 明示 → glossary_candidates の最初に存在するもの）
+- 辞書: ~/voice_memos/glossary → paths.extra_glossary_dirs（明示追加）→ <project>/voice_memos/glossary
+  の順にマージ（同 canonical は後の層＝プロジェクトが優先）
 - 出力: 常に <project>/voice_memos/transcripts/<録音日>_<元ファイル名>.md
 - 退避: 音声が見つかった層の processed/
 --no-global でグローバル層を無視。
@@ -62,10 +62,11 @@ def _deep_merge(base: dict, override: dict) -> dict:
 
 
 def load_config(project_root: Path) -> dict:
-    cfg = json.loads((SKILL_DIR / "config.default.json").read_text(encoding="utf-8"))
+    # utf-8-sig: メモ帳や PowerShell 5.1 が付ける BOM を許容する
+    cfg = json.loads((SKILL_DIR / "config.default.json").read_text(encoding="utf-8-sig"))
     local = project_root / "voice_memos" / "config.json"
     if local.exists():
-        cfg = _deep_merge(cfg, json.loads(local.read_text(encoding="utf-8")))
+        cfg = _deep_merge(cfg, json.loads(local.read_text(encoding="utf-8-sig")))
         print(f"config: {local}")
     return cfg
 
@@ -73,21 +74,17 @@ def load_config(project_root: Path) -> dict:
 def resolve_paths(cfg: dict, project_root: Path) -> dict:
     """プロジェクト層とグローバル層（~/voice_memos）のパスを解決する。
 
-    - glossary: プロジェクトは paths.glossary（明示）→ glossary_candidates の最初に存在するもの。
-      グローバルは <global_root>/<global_paths.glossary>。両方をマージして使う。
+    - glossary: マージ順（後ほど優先）= グローバル <global_root>/glossary
+      → paths.extra_glossary_dirs（明示追加。プロジェクト共有の辞書など）
+      → プロジェクト paths.glossary（既定 voice_memos/glossary、最優先）。
     - inbox: プロジェクト → グローバルの順に両方を走査。
     - transcripts: 常にプロジェクト側（呼び出し元の作業場所に集約）。
     - processed: 音声が見つかった層の processed/ に退避。
     """
     p = cfg["paths"]
-    glossary: Path | None = None
-    if p.get("glossary"):
-        glossary = project_root / p["glossary"]
-    else:
-        for cand in p.get("glossary_candidates", []):
-            if (project_root / cand).is_dir():
-                glossary = project_root / cand
-                break
+    glossary = project_root / p["glossary"]
+    extra = [Path(d).expanduser() for d in p.get("extra_glossary_dirs", []) or []]
+    extra = [d if d.is_absolute() else project_root / d for d in extra]
 
     global_root: Path | None = None
     raw = cfg.get("global_root")
@@ -96,6 +93,7 @@ def resolve_paths(cfg: dict, project_root: Path) -> dict:
     g = cfg.get("global_paths", {})
     return {
         "glossary": glossary,
+        "extra_glossary_dirs": extra,
         "inbox": project_root / p["inbox"],
         "transcripts": project_root / p["transcripts"],
         "processed": project_root / p["processed"],
@@ -187,24 +185,28 @@ def unique_path(path: Path) -> Path:
 
 
 def load_merged_glossary(paths: dict, use_global: bool) -> list[dict]:
-    """グローバル層 → プロジェクト層の順でマージ（プロジェクト優先）。"""
-    layers: list[list[dict]] = []
-    labels: list[str] = []
+    """グローバル → extra_glossary_dirs → プロジェクトの順でマージ（後ほど優先）。"""
+    sources: list[tuple[str, Path | None]] = []
     if use_global and paths.get("global_glossary"):
-        g = load_glossary(paths["global_glossary"])
-        if g:
-            layers.append(g)
-            labels.append(f"global {len(g)}")
-    p = load_glossary(paths.get("glossary"))
-    if p:
-        layers.append(p)
-        labels.append(f"project {len(p)}")
-    entries = merge_glossaries(*layers) if layers else []
-    if entries:
-        print(f"[A] glossary {len(entries)} entries ({' + '.join(labels)})")
+        sources.append(("global", paths["global_glossary"]))
+    for d in paths.get("extra_glossary_dirs", []):
+        sources.append(("extra", d))
+    sources.append(("project", paths.get("glossary")))
+
+    layers: list[list[dict]] = []
+    for label, d in sources:
+        entries = load_glossary(d)
+        if entries:
+            layers.append(entries)
+            print(f"[A] glossary {label:7s} {len(entries):3d} entries  {d}")
+        elif d is not None and label != "global":
+            print(f"[A] glossary {label:7s}   0 entries  {d}（無いか空）")
+    merged = merge_glossaries(*layers) if layers else []
+    if merged:
+        print(f"[A] glossary merged {len(merged)} entries（同じ canonical は後の層が優先）")
     else:
         print("[A] glossary なし（辞書ディレクトリが無いか空）")
-    return entries
+    return merged
 
 
 def process_one(
