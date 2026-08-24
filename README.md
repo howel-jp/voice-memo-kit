@@ -36,6 +36,9 @@ voice-memo-kit/                 # = プラグインルート = スキルのベ�
 
 更新: `/plugin marketplace update howel-jp` → `/plugin update voice-memo@howel-jp`（`plugin.json` の `version` が上がったときだけ配信される）。
 
+インストール後、コマンド一覧には `/voice-memo:voice-memo`（プラグイン名:スキル名）として表示される。`/voice-memo` と打てば前方一致で解決される。
+初回実行時は venv 構築の案内（`setup.ps1`）が出る。venv は `~/.claude/plugins/data/voice-memo-howel-jp/.venv` に置かれ、プラグイン更新後も保持される。
+
 開発中・ローカル試験は `claude --plugin-dir C:\Projects\voice-memo-kit`、または
 `~/.claude/skills/voice-memo` をキットへのジャンクションにすると `voice-memo@skills-dir` として自動ロードされる
 （この方式では `${CLAUDE_PLUGIN_ROOT}` 等の変数は展開されないが、ランチャーのフォールバック探索で動く）。
