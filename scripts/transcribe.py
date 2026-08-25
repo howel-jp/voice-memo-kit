@@ -316,11 +316,13 @@ def main() -> int:
     parser.add_argument("--timestamps", action="store_true", help="各段落頭に [mm:ss] を付与")
     parser.add_argument("--keep", action="store_true", help="処理後も音声を移動しない")
     parser.add_argument("--no-proofread", action="store_true", help="Claude 校閲をスキップ")
-    parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
+    parser.add_argument("--device", choices=["cuda", "cpu"], default=None,
+                        help="推論デバイス（省略時は config の whisper.device、既定 cuda）")
     args = parser.parse_args()
 
     project_root = (args.project or Path.cwd()).resolve()
     cfg = load_config(project_root)
+    device = args.device or cfg.get("whisper", {}).get("device", "cuda")
     paths = resolve_paths(cfg, project_root)
     out_dir = args.out_dir or paths["transcripts"]
     use_global = not args.no_global
@@ -347,7 +349,7 @@ def main() -> int:
         print(f"global ={paths['global_root']}")
     n_proj = sum(1 for _, d in inputs if d == paths["processed"])
     print(f"対象 {len(inputs)} 件（project {n_proj} / global {len(inputs) - n_proj}） / "
-          f"device={args.device} / glossary={not args.no_glossary} / proofread={use_proofread}")
+          f"device={device} / glossary={not args.no_glossary} / proofread={use_proofread}")
 
     entries = [] if args.no_glossary else load_merged_glossary(paths, use_global)
 
@@ -357,7 +359,7 @@ def main() -> int:
             done.append(process_one(
                 audio, cfg=cfg, processed_dir=processed_dir, out_dir=out_dir,
                 entries=entries, with_timestamps=args.timestamps,
-                keep=args.keep, device=args.device, use_proofread=use_proofread,
+                keep=args.keep, device=device, use_proofread=use_proofread,
             ))
         except Exception as e:
             print(f"[ERROR] {audio.name} の処理に失敗: {e}", file=sys.stderr)

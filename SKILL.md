@@ -57,6 +57,7 @@ Get-ChildItem voice_memos\inbox, "$env:USERPROFILE\voice_memos\inbox" -File -Err
 - **注意**: `2>&1 | Select-String` 等で stderr を混ぜると、ライブラリ警告が終了エラー扱いされ途中中断する
   ことがある。**素直にそのまま実行**するか、出力を `| Out-String` で受ける。成否は終了コードと transcript 生成有無で判断する。
 - 文字起こし自体が失敗した場合（GPU 不調等）は `--device cpu` を案内、またはユーザーに状況を伝える。
+  GPU の無い PC で常用するなら `voice_memos/config.json` に `{"whisper": {"device": "cpu"}}` を書く（実時間の約 1.4 倍かかる）。
 - 上のパス変数が展開されず `${CLAUDE_PLUGIN_ROOT}` のまま見える場合（プラグインではなく個人スキルとして読み込まれている）は、
   スキル読込時に示されたベースディレクトリを使い、`-DataDir` は付けない。
 

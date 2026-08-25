@@ -40,6 +40,17 @@ class LoadConfigTest(unittest.TestCase):
         self.assertEqual(cfg["paths"]["glossary"], "voice_memos/glossary")
         self.assertEqual(cfg["paths"]["extra_glossary_dirs"], [])
         self.assertEqual(cfg["global_root"], "~/voice_memos")
+        self.assertEqual(cfg["whisper"]["device"], "cuda")
+
+    def test_device_override_in_project_config(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "voice_memos").mkdir()
+            (root / "voice_memos" / "config.json").write_text(
+                json.dumps({"whisper": {"device": "cpu"}}), encoding="utf-8")
+            cfg = t.load_config(root)
+        self.assertEqual(cfg["whisper"]["device"], "cpu")
+        self.assertEqual(cfg["whisper"]["model"], "large-v3")  # 他のキーは既定のまま
 
     def test_project_config_overrides_and_tolerates_bom(self):
         with tempfile.TemporaryDirectory() as d:

@@ -1,7 +1,7 @@
 {
   "name": "voice-memo",
   "displayName": "Voice Memo Kit",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "ボイスメモをローカル WhisperX で文字起こし＋Claude 校閲し、その内容を口述の指示・思考として会話を始める /voice-memo スキル",
   "author": {
     "name": "howel-jp"

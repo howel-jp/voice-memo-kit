@@ -15,6 +15,7 @@
   "whisper": {
     "model": "large-v3",
     "compute_type": "int8",
+    "device": "cuda",
     "language": "ja",
     "batch_size": 8,
     "chunk_size": 30
