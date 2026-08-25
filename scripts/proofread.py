@@ -9,6 +9,7 @@ Claude Max サブスクリプションの容量内で動作（ANTHROPIC_API_KEY 
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -119,12 +120,22 @@ def _call_claude(system_prompt: str, user_message: str, model: str) -> str:
     return data.get("result", "") or ""
 
 
+_TRAILING_NOTE_RE = re.compile(
+    r"\n\s*(?:---+|\*\*\*+)\s*\n\s*(?:修正|校閲|変更|注[:：記]|補足|※)[\s\S]*$"
+)
+
+
 def _strip_wrapping(text: str) -> str:
-    """前置き・コードフェンスを保険で除去する。"""
+    """前置き・コードフェンス・末尾の校閲メモを保険で除去する。
+
+    モデルが規律に反して本文の後ろに「---\\n修正3点：…」のような注記を付けることがある
+    （2026-08-25 に観測）。区切り線の後に修正/校閲/注記で始まるブロックが続く場合は本文から落とす。
+    """
     t = text.strip()
     if t.startswith("```"):
         lines = [ln for ln in t.split("\n") if not ln.strip().startswith("```")]
         t = "\n".join(lines).strip()
+    t = _TRAILING_NOTE_RE.sub("", t).strip()
     return t
 
 

@@ -48,6 +48,17 @@ class ProofreadBodyTest(_Patched):
         self._stub("```\n" + self.BODY + "\n```")
         self.assertEqual(p.proofread_body(self.BODY, []), self.BODY)
 
+    def test_strips_trailing_revision_notes(self):
+        # 2026-08-25 に観測: 本文の後ろに「---\n修正3点：…」が付いた
+        self._stub(self.BODY + "\n\n---\n\n修正3点：\n- 「力化」→「強化」\n- 「撃つ」→「打つ」\n\n「おめん」は原文のまま残しました。")
+        self.assertEqual(p.proofread_body(self.BODY, []), self.BODY)
+
+    def test_keeps_body_separator_without_notes(self):
+        # 本文内の区切り線（後ろが本文）は落とさない
+        body = self.BODY + "\n\n---\n\n" + self.BODY
+        self._stub(body)
+        self.assertEqual(p.proofread_body(body, []), body)
+
     def test_empty_body_short_circuits_without_calling(self):
         cap = self._stub("should not be used")
         self.assertEqual(p.proofread_body("   ", []), "   ")
