@@ -9,6 +9,8 @@
 - 校閲: Claude Code CLI（サブスクリプション容量内・追加課金なし）。校閲前データも md 内に保持
 - 出力: `<project>/voice_memos/transcripts/<録音日>_<元ファイル名>.md`
 
+📝 紹介記事（入れ方・使い方を順に説明）: [ボイスメモをそのままClaude Codeの指示にするスキル｜note](https://note.com/trinity_nexus/n/n7ac7edfae794)
+
 ## 構成（Claude Code プラグイン・単一スキル構成）
 
 ```
