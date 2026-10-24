@@ -56,8 +56,17 @@ Get-ChildItem voice_memos\inbox, "$env:USERPROFILE\voice_memos\inbox" -File -Err
 - 出力は `voice_memos/transcripts/<録音日>_<元ファイル名>.md`、音声は見つかった層の `processed/` へ自動退避。
 - **注意**: `2>&1 | Select-String` 等で stderr を混ぜると、ライブラリ警告が終了エラー扱いされ途中中断する
   ことがある。**素直にそのまま実行**するか、出力を `| Out-String` で受ける。成否は終了コードと transcript 生成有無で判断する。
+- 前面で実行するときは、道具の timeout を明示する（Claude Code の Bash / PowerShell の道具は、既定 2 分・最大 10 分 = 600000 ms）。
+- 音声が長いとき（目安 30 分以上。CPU で動かすとき（`--device cpu` か `whisper.device: cpu`）は、文字起こしだけで音声の長さの
+  4 分の 3 ほどかかるので、もっと短い音声でも）は、終わるまで 10 分を超えることがある（長い文字起こしは分けて順に校閲するため）。
+  10 分を超えそうなら、上のコマンドを Bash / PowerShell の道具の `run_in_background` で実行し、道具の終わりの通知
+  （ランチャーの終了コードと出力）を待ってから §3 へ進む。通知の前に終わりを確かめるなら、ランチャーの出力の最後の行
+  `完了: m/n 件`（n は対象の数、m は md を書けた数。m が n より小さければ失敗したものがあり、全部失敗なら終了コード 1）か、
+  `voice_memos/transcripts/` に今回の md が対象の数だけできたことを見る。`Start-Job`・`Start-Process` などで切り離さない
+  （出力と終了コードを見失う）。
 - 文字起こし自体が失敗した場合（GPU 不調等）は `--device cpu` を案内、またはユーザーに状況を伝える。
-  GPU の無い PC で常用するなら `voice_memos/config.json` に `{"whisper": {"device": "cpu"}}` を書く（実時間の約 1.4 倍かかる）。
+  GPU の無い PC で常用するなら `voice_memos/config.json` に `{"whisper": {"device": "cpu"}}` を書く
+  （文字起こしに音声の長さの 4 分の 3 ほどかかる。実時間の約 1.4 倍の速さ）。
 - 上のパス変数が展開されず `${CLAUDE_PLUGIN_ROOT}` のまま見える場合（プラグインではなく個人スキルとして読み込まれている）は、
   スキル読込時に示されたベースディレクトリを使い、`-DataDir` は付けない。
 
@@ -81,8 +90,10 @@ Get-ChildItem voice_memos\inbox, "$env:USERPROFILE\voice_memos\inbox" -File -Err
 
 各 md の構成:
 - frontmatter（`date / source / duration / engine / segments / glossary_replacements / proofread`。校閲に失敗したときだけ、続けて `proofread_error / proofread_error_detail`）
-  - `proofread`: 本文が Claude で校閲された文ならモデル名。`false` なら本文は校閲されていない（校閲しない設定、文字起こしが空、または校閲に失敗）
-  - `proofread_error`: 校閲を試みたが結果を使わなかった理由。`timeout`（時間切れ）/ `cli_error`（Claude CLI のエラー）/ `empty`（空の結果）/ `too_short`（短すぎる＝要約の疑い）/ `incomplete`（一部が欠けた疑い）/ `error`（その他）。`proofread_error_detail` は数などの補足 1 行
+  - `proofread`: 本文が Claude で校閲された文ならモデル名。`false` なら本文は校閲されていない（校閲しない設定、文字起こしが空、または校閲に失敗）。
+    長い文字起こし（3,000 字を超えるもの）は分けて校閲してつなぐが、モデル名なら本文の全部が校閲後で、一部でも校閲できなければ `false`
+  - `proofread_error`: 校閲を試みたが結果を使わなかった理由。`timeout`（時間切れ）/ `cli_error`（Claude CLI のエラー）/ `empty`（空の結果）/ `too_short`（短すぎる＝要約の疑い）/ `incomplete`（一部が欠けた疑い）/ `error`（その他）。`proofread_error_detail` は数などの補足 1 行。
+    分けて校閲したときは、何番目のまとまりで止まったかが前に付く（例: `まとまり 3/5: num_turns 3`）
 - 本文: `proofread` がモデル名なら校閲後。`false` なら校閲前の文字起こし（辞書の置き換え後）
 - `<details>校閲前（辞書の置き換え後）</details>`: 校閲に渡した文。本文が校閲後のときだけ付く（`false` のときは本文と同じなので付かない）
 - `<details>置き換え前（Whisper の出力）</details>`: 辞書の置き換え（wrong_variants → canonical）の前の文。置き換えが 1 箇所以上あったときだけ付く。

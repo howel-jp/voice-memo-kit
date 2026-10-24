@@ -1,12 +1,15 @@
 """校閲 (Claude CLI) の所要時間と本文の字数の関係を、合成の文で測る (#4 の U4)。
 
 キットの `proofread.proofread_body` をそのまま呼ぶ。変えるのは `subprocess.run` の timeout だけ
-(既定 1,800 秒。900 秒を超えるときの実の時間を知るため)。CLI が返す JSON (duration_ms、usage など)
-は、`_call_claude` が消す前に写し取る。送る本文は synth.py の合成の文だけ。
+(既定 1,800 秒。900 秒を超えるときの実の時間を知るため。キットと同じにするなら --timeout 900)。
+CLI が返す JSON (duration_ms、usage など) は、キットが result 以外を捨てる前に (`_call_claude_json` が
+書かせる stdout のファイルから) 写し取る。送る本文は synth.py の合成の文だけ。
 
     python tools/measure/proofread_timing.py --call-claude --sizes 1000,4000,8000 --out-dir <dir> --label run1
 
---call-claude を付けたときだけ CLI を呼ぶ (1 サイズ 1 回)。import しただけでは何もしない。
+--call-claude を付けたときだけ CLI を呼ぶ (1 サイズにつき proofread_body を 1 回。3,000 字を超える本文は
+キットが分けて校閲するので、CLI の呼び出しは 2 回以上になる。呼び出しごとの記録は calls)。
+import しただけでは何もしない。
 """
 from __future__ import annotations
 
@@ -24,17 +27,32 @@ import _kit  # noqa: E402
 _kit.use_kit_scripts()
 
 
+_BODY_MARK = "【文字起こし本文】\n"
+
+
 def make_run_wrapper(real_run, timeout: float, record: dict):
-    """subprocess.run の代わり。timeout だけを替え、CLI の stdout (JSON のファイル) を写し取る。"""
+    """subprocess.run の代わり。timeout だけを替え、CLI の stdout (JSON のファイル) を写し取る。
+
+    呼び出しごとに record["calls"] に足す (input_chars: そのまとまりの字数、wall_sec、raw_json)。
+    record["flags"] は最初の呼び出しのもの。record["wall_sec"]・record["raw_json"] は最後の呼び出しのもの。
+    """
 
     def run(cmd, *args, **kwargs):
         kwargs["timeout"] = timeout
-        record["flags"] = [c for c in cmd[1:] if isinstance(c, str) and c.startswith("--")]
+        record.setdefault("flags", [c for c in cmd[1:] if isinstance(c, str) and c.startswith("--")])
+        call: dict = {}
+        record.setdefault("calls", []).append(call)
+        fin_name = getattr(kwargs.get("stdin"), "name", None)
+        if fin_name:
+            try:  # 別に開いて読む (子に渡すファイルの読み位置は動かさない)
+                call["input_chars"] = len(Path(fin_name).read_text(encoding="utf-8").split(_BODY_MARK, 1)[-1])
+            except OSError:
+                pass
         t0 = time.perf_counter()
         try:
             cp = real_run(cmd, *args, **kwargs)
         finally:
-            record["wall_sec"] = round(time.perf_counter() - t0, 2)
+            record["wall_sec"] = call["wall_sec"] = round(time.perf_counter() - t0, 2)
         fout = kwargs.get("stdout")
         name = getattr(fout, "name", None)
         if name:
@@ -43,12 +61,34 @@ def make_run_wrapper(real_run, timeout: float, record: dict):
             except Exception:
                 pass
             try:
-                record["raw_json"] = Path(name).read_text(encoding="utf-8")
+                record["raw_json"] = call["raw_json"] = Path(name).read_text(encoding="utf-8")
             except OSError:
                 pass
         return cp
 
     return run
+
+
+_SUM_KEYS = ("duration_ms", "duration_api_ms", "input_tokens", "cache_creation_input_tokens",
+             "cache_read_input_tokens", "output_tokens", "result_chars")
+
+
+def merge_meta(metas: list[dict]) -> dict:
+    """呼び出しが 2 回以上のときの、行の列の値 (時間とトークンは合計、num_turns は最大、is_error はどれか)。"""
+    if len(metas) == 1:
+        return metas[0]
+    out: dict = {}
+    for k in _SUM_KEYS:
+        vals = [m.get(k) for m in metas if m.get(k) is not None]
+        out[k] = sum(vals) if vals else None
+    turns = [m.get("num_turns") for m in metas if isinstance(m.get("num_turns"), int)]
+    out["num_turns"] = max(turns) if turns else None
+    out["is_error"] = any(bool(m.get("is_error")) for m in metas)
+    last = metas[-1] if metas else {}
+    out["subtype"], out["stop_reason"] = last.get("subtype"), last.get("stop_reason")
+    if "error_result_head" in last:
+        out["error_result_head"] = last["error_result_head"]
+    return out
 
 
 def cli_meta(raw_json: str | None) -> dict:
@@ -132,7 +172,11 @@ def measure_one(body: str, canonicals: list[str], model: str, timeout: float, re
         except Exception as e:  # noqa: BLE001
             status, err = "error", type(e).__name__
     total = round(time.perf_counter() - t0, 2)
-    meta = cli_meta(record.get("raw_json"))
+    calls = [{"input_chars": c.get("input_chars"), "wall_sec": c.get("wall_sec"), **cli_meta(c.get("raw_json"))}
+             for c in record.get("calls", [])]
+    # 呼び出しが 1 回のときは、今までの列と同じ値 (#4 の数を読み直せるように)
+    meta = cli_meta(record.get("raw_json")) if len(calls) <= 1 else merge_meta(calls)
+    wall_cli = record.get("wall_sec") if len(calls) <= 1 else round(sum(c["wall_sec"] or 0 for c in calls), 2)
     row = {
         "status": status,
         "error": err,
@@ -145,11 +189,13 @@ def measure_one(body: str, canonicals: list[str], model: str, timeout: float, re
         "ratio": round(len(out) / max(1, len(body)), 3) if out else None,
         "returned_input_unchanged": out == body,
         "output_ends_cleanly": _ends_cleanly(out) if out else None,
-        "wall_sec_cli": record.get("wall_sec"),
+        "wall_sec_cli": wall_cli,
         "wall_sec_total": total,
         "flags": record.get("flags"),
         **coverage(body, out),
         **meta,
+        "cli_calls": len(calls),
+        "calls": calls,
     }
     return row, out
 
