@@ -204,10 +204,14 @@ def real_rows(encode, global_dir: Path | None, project_roots: list[Path], hf_tok
         rows.append(row("G", [("global", g_entries)], g_warn))
     i = 0
     for root in sorted(project_roots, key=lambda p: str(p).lower()):
-        (cfg, _w) = _quiet(transcribe.load_config, root)
+        warns = g_warn
+        try:
+            (cfg, _w) = _quiet(transcribe.load_config, root)
+        except (ValueError, OSError):  # 壊れた config.json (JSONDecodeError は ValueError)。数えて既定の設定で続ける
+            warns += 1
+            cfg = json.loads((transcribe.SKILL_DIR / "config.default.json").read_text(encoding="utf-8-sig"))
         (paths, _w2) = _quiet(transcribe.resolve_paths, cfg, root)
         extra_layers = []
-        warns = g_warn
         for d in paths.get("extra_glossary_dirs", []):
             ents, w = _layer_entries(d, "extra")
             extra_layers.append(ents)

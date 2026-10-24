@@ -185,6 +185,38 @@ class RealRowsPrivacyTest(unittest.TestCase):
                 self.assertNotIn(s, out)
             self.assertNotIn("ZQX", out)
 
+    def test_main_does_not_print_argument_paths(self):
+        """任意 2 (a): 引数のパス (--global-dir・--projects-glob) を出力しないこと。目印をパスの上の方に置く。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            g, projects = self._layout(Path(tmp) / "zq-root-marker")
+            buf = io.StringIO()
+            with mock.patch.object(ptok._kit, "load_hf_tokenizer", lambda path=None: object()), \
+                    mock.patch.object(ptok._kit, "hf_encoder", lambda tok: char_encoder), \
+                    contextlib.redirect_stdout(buf):
+                rc = ptok.main(["--tokenizer", str(Path(tmp) / "zq-tok.json"), "--no-verify", "real",
+                                "--global-dir", str(g), "--projects-glob", str(projects / "*")])
+        self.assertEqual(rc, 0)
+        out = buf.getvalue()
+        self.assertIn("rows: 3", out)
+        for s in ["ZQX", "zq-", "zq_", "people-zq"]:
+            self.assertNotIn(s, out)
+
+    def test_broken_project_config_is_counted_not_fatal(self):
+        """任意 5: 壊れた voice_memos/config.json は止まらずに parse_warnings に数える (パスは出さない)。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "brokencfg-zq"
+            (root / "voice_memos" / "glossary").mkdir(parents=True)
+            (root / "voice_memos" / "config.json").write_text("{broken", encoding="utf-8")
+            (root / "voice_memos" / "glossary" / "x.json").write_text(
+                json.dumps({"entries": [{"canonical": "ZQX壊れ設定の語"}]}, ensure_ascii=False), encoding="utf-8")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rows = ptok.real_rows(char_encoder, None, ptok.find_project_roots(str(Path(tmp) / "*")))
+        self.assertEqual([(r["label"], r["merged_items"], r["parse_warnings"]) for r in rows], [("P1", 1, 1)])
+        for out in (buf.getvalue(), json.dumps(rows, ensure_ascii=False)):
+            self.assertNotIn("ZQX", out)
+            self.assertNotIn("brokencfg", out)
+
 
 class TranscriptStatsPrivacyTest(unittest.TestCase):
     MD_DETAILS = (
@@ -217,6 +249,8 @@ class TranscriptStatsPrivacyTest(unittest.TestCase):
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 ts.main(["--root", str(Path(tmp) / "*" / "voice_memos" / "transcripts")])
+                ts.main(["--root", str(d)])  # 任意 2 (a): 目印を含むパスを引数に渡しても出さない
+        self.assertEqual(buf.getvalue().count("summary:"), 2)
         self.assertEqual(res["summary"]["files"], 2)
         self.assertEqual([r["label"] for r in res["rows"]], ["T1", "T2"])
         self.assertEqual(res["rows"][0]["chars_per_min"], round(len("ZQX校閲前の一文目です") / 2.0, 1))
@@ -298,11 +332,43 @@ class ProofreadTimingTest(unittest.TestCase):
 
 
 class TimeoutWaitTest(unittest.TestCase):
-    def test_descendants(self):
-        procs = [(1, 0, "root.exe"), (2, 1, "child.exe"), (3, 2, "grand.exe"), (4, 9, "other.exe"), (5, 1, "c2.exe")]
-        self.assertEqual(tw.descendants(procs, 1), {2: "child.exe", 3: "grand.exe", 5: "c2.exe"})
-        self.assertEqual(tw.descendants(procs, 4), {})
+    def test_verified_descendants(self):
+        procs = [(1, 0, "root.exe"), (2, 1, "child.exe"), (3, 2, "grand.exe"), (4, 9, "other.exe"),
+                 (5, 1, "c2.exe"), (6, 2, "old.exe"), (7, 1, "before-root.exe"), (8, 1, "no-ctime.exe")]
+        ct = {1: 100, 2: 150, 3: 160, 4: 10, 5: 120, 6: 120, 7: 50}.get
+        got = tw.verified_descendants(procs, 1, 100, ct)
+        self.assertEqual(got, {2: ("child.exe", 150), 3: ("grand.exe", 160), 5: ("c2.exe", 120)})
+        # 6 は親 (2) より前に作られた = 2 の PID を前に使っていたプロセスの子。7 は root より前。8 は作成時刻が取れない
+        self.assertEqual(tw.verified_descendants(procs, 1, None, ct), {})
+        self.assertEqual(tw._names(got), {"child.exe": 1, "grand.exe": 1, "c2.exe": 1})
         self.assertEqual(tw._names({2: "a.exe", 3: "a.exe", 5: "b.exe"}), {"a.exe": 2, "b.exe": 1})
+
+    def test_reused_pid_is_not_killed(self):
+        """推奨 1 (PR #7 のレビュー 1 回目): 見た PID が、同じ名前の別のプロセスに再利用されていたら止めない。"""
+        state = {"procs": [(1, 0, "claude.exe"), (5, 1, "conhost.exe"), (6, 1, "cmd.exe")],
+                 "ct": {1: 100, 5: 110, 6: 120}}
+        killed = []
+        w = tw.Watch([1], snap=lambda: state["procs"], ctime_of=lambda pid: state["ct"].get(pid),
+                     kill=lambda pid: killed.append(pid) or True)
+        w.seen.update(w.alive_descendants())
+        self.assertEqual(set(w.seen), {5, 6})
+        # root が終わり、5 は同じ名前の無関係のプロセス (親も作成時刻も別) が再利用。6 は親が消えた本物の子孫
+        state["procs"] = [(5, 999, "conhost.exe"), (6, 1, "cmd.exe"), (999, 0, "explorer.exe")]
+        state["ct"] = {5: 300, 6: 120, 999: 5}
+        left = w.alive_descendants()
+        self.assertEqual(left, {6: ("cmd.exe", 120)})
+        self.assertEqual(w.kill_verified(left), {6: ("cmd.exe", 120)})
+        self.assertEqual(killed, [6])
+        # 見張りが見た後で 6 が再利用されたら、止める直前の確かめで止めない
+        state["ct"][6] = 400
+        self.assertEqual(w.kill_verified({6: ("cmd.exe", 120)}), {})
+        self.assertEqual(killed, [6])
+
+    def test_reused_root_pid_children_are_not_ours(self):
+        # root (1, 作成 100) が終わり、PID 1 を別のプロセス (作成 500) が使い、その子 9 (作成 600) がいる
+        procs = [(1, 0, "new.exe"), (9, 1, "x.exe"), (6, 1, "ours.exe")]
+        ct = {1: 500, 9: 600, 6: 120}.get
+        self.assertEqual(tw.verified_descendants(procs, 1, 100, ct), {6: ("ours.exe", 120)})
 
     def test_claude_mode_needs_flag(self):
         with mock.patch.object(subprocess, "Popen", side_effect=AssertionError("プロセスを起こした")):
@@ -335,11 +401,19 @@ class PromptBudgetPureTest(unittest.TestCase):
 class ImportSideEffectTest(unittest.TestCase):
     def test_import_is_light(self):
         code = (
-            "import sys, subprocess, socket\n"
+            "import sys, os, subprocess, socket, ctypes\n"
             "class Boom:\n"
             "    def __init__(self, *a, **k): raise AssertionError('side effect on import')\n"
+            "class BoomLoader:\n"
+            "    def __getattr__(self, name): raise AssertionError('side effect on import')\n"
             "def boom(*a, **k): raise AssertionError('side effect on import')\n"
             "subprocess.Popen = Boom; socket.socket = Boom; socket.create_connection = boom\n"
+            # 任意 2 (b): os のプロセスの起動と ctypes の DLL の読み込みも塞ぐ
+            "for n in dir(os):\n"
+            "    if n.startswith(('spawn', 'exec')) or n in ('system', 'startfile', 'popen'):\n"
+            "        setattr(os, n, boom)\n"
+            "ctypes.CDLL = Boom; ctypes.WinDLL = Boom\n"
+            "ctypes.cdll = ctypes.windll = BoomLoader()\n"
             f"sys.path.insert(0, {str(ROOT / 'tools' / 'measure')!r})\n"
             "import _kit, synth, prompt_tokens, transcript_stats, proofread_timing, timeout_wait, prompt_budget\n"
             "heavy = ['torch', 'whisperx', 'faster_whisper', 'ctranslate2', 'tokenizers', 'numpy', 'pyannote']\n"
