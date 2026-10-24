@@ -571,6 +571,9 @@ class TimeoutWaitTest(unittest.TestCase):
         procs2 = procs + [(7, 6, "grand.exe")]
         ct2 = {1: 100, 5: 300, 6: 120, 7: 250}.get
         self.assertEqual(tw.verified_descendants(procs2, 1, 100, ct2, before=200), {6: ("cmd.exe", 120)})
+        # 境目 (PR #13 のレビュー 1 回目の任意 1): before と同じ刻みに作られたものは含めない (次の見回りで拾う)
+        self.assertEqual(tw.verified_descendants(procs, 1, 100, ct, before=120), {})
+        self.assertEqual(tw.verified_descendants(procs, 1, 100, ct, before=121), {6: ("cmd.exe", 120)})
         # Watch は、スナップショットの直前に時計を読み、その値を before にする
         order = []
         w = tw.Watch([1], snap=lambda: order.append("snap") or procs, ctime_of=lambda pid: order.append(pid) or ct(pid),
