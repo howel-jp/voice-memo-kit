@@ -52,7 +52,11 @@ def make_run_wrapper(real_run, timeout: float, record: dict):
 
 
 def cli_meta(raw_json: str | None) -> dict:
-    """CLI の JSON から、時間とトークンの数だけを取り出す (result の本文は入れない)。"""
+    """CLI の JSON から、時間とトークンの数だけを取り出す (result の本文は入れない)。
+
+    is_error のときだけ、result の先頭 300 字 (CLI のエラーの文) を error_result_head に入れる
+    (2026-10-24、12,638 字で num_turns 4・出力 128,001 トークンの is_error を観測したが、文を残していなかった)。
+    """
     if not raw_json:
         return {}
     try:
@@ -60,7 +64,9 @@ def cli_meta(raw_json: str | None) -> dict:
     except json.JSONDecodeError:
         return {"json_error": True}
     usage = data.get("usage") or {}
+    extra = {"error_result_head": (data.get("result") or "")[:300]} if data.get("is_error") else {}
     return {
+        **extra,
         "duration_ms": data.get("duration_ms"),
         "duration_api_ms": data.get("duration_api_ms"),
         "num_turns": data.get("num_turns"),

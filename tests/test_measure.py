@@ -269,6 +269,13 @@ class ProofreadTimingTest(unittest.TestCase):
         self.assertEqual(cov["last_output_matches_input_para"], 5)
         self.assertEqual(cov["input_paras_not_matched"], 3)
 
+    def test_cli_error_keeps_only_error_text_head(self):
+        raw = json.dumps({"is_error": True, "num_turns": 4, "result": "E" * 500, "usage": {"output_tokens": 9}})
+        meta = pt.cli_meta(raw)
+        self.assertEqual((meta["num_turns"], meta["output_tokens"], len(meta["error_result_head"])), (4, 9, 300))
+        ok = pt.cli_meta(json.dumps({"is_error": False, "result": "本文"}))
+        self.assertNotIn("error_result_head", ok)  # 成功のときは result を入れない
+
     def test_empty_result_is_flagged(self):
         row, out = pt.measure_one(self.BODY, [], "m", 10.0, real_run=self._fake_run("", []))
         self.assertTrue(row["returned_input_unchanged"])  # #3 §2 の 6a: 空の結果は元の本文が返る
