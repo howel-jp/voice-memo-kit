@@ -122,20 +122,32 @@ def effect(audio: Path, source_text: Path | None, device: str, compute_type: str
     _kit.force_offline_env()
     import engine
 
+    import glossary
+    import synth
+
     encode = _kit.hf_encoder(_kit.load_hf_tokenizer())
-    src_chars = len(source_text.read_text(encoding="utf-8").replace("\n", "")) if source_text else None
+    source = source_text.read_text(encoding="utf-8").replace("\n", "") if source_text else ""
+    src_chars = len(source) if source_text else None
     rows = []
-    for label, text, _p in _prompt_sources(encode, "full", items, seed):
+    for n in items:
+        entries = synth.mixed_entries(n, seed) if n else []
+        text = glossary.build_initial_prompt(entries) if entries else ""
         res = engine.transcribe_audio(audio, model_name="large-v3", compute_type=compute_type, language="ja",
-                                      batch_size=8, chunk_size=30, device=device, initial_prompt=text or "")
+                                      batch_size=8, chunk_size=30, device=device, initial_prompt=text)
         segs = res["segments"]
         seg_tokens = [len(encode((s.get("text") or "").strip())[0]) for s in segs]
         seg_secs = [float(s.get("end", 0)) - float(s.get("start", 0)) for s in segs]
-        chars = sum(len((s.get("text") or "").replace(" ", "").strip()) for s in segs)
+        out = "".join((s.get("text") or "").replace(" ", "").strip() for s in segs)
+        chars = len(out)
         prompt_tokens = len(encode(" " + text.strip())[0]) if text else 0
+        # 音声に無い辞書の語が出力に出た数 (prompt の語の並びを書き写したしるし)
+        prompt_only = [e["canonical"] for e in entries if e["canonical"] not in source]
         rows.append({
             "device": device,
-            "prompt": label,
+            "prompt": f"items={n}",
+            "prompt_only_words": len(prompt_only),
+            "prompt_only_words_in_output": sum(1 for w in prompt_only if w in out),
+            "out_head": out[:12],  # 合成の音声の文字起こし (中身の確かめ用)
             "prompt_tokens": prompt_tokens,
             "prompt_tokens_kept": min(prompt_tokens, KEEP),
             "duration_sec": round(res["duration"], 1),
@@ -148,7 +160,23 @@ def effect(audio: Path, source_text: Path | None, device: str, compute_type: str
             "out_per_source": round(chars / src_chars, 3) if src_chars else None,
             "tokens_per_30s": round(sum(seg_tokens) / (res["duration"] / 30.0), 1) if res["duration"] else None,
         })
+        _free_models(engine)
     return rows
+
+
+def _free_models(engine) -> None:
+    """engine は initial_prompt ごとにモデルをキャッシュするので、prompt を替えるたびに捨てる
+    (捨てないと large-v3 が prompt の数だけ GPU に載り、8GB の GPU では極端に遅くなる。2026-10-24 に観測)。"""
+    import gc
+
+    engine.clear_model_cache()
+    gc.collect()
+    try:
+        import torch
+
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
 
 
 def _ints(text: str) -> list[int]:
