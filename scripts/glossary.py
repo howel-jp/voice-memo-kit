@@ -111,6 +111,7 @@ class PromptPlan(NamedTuple):
     marked: int  # 印の語の数
     marked_reached: int | None  # 届く印の語の数
     selected: bool  # キットが語を選んだ（印の語があって、全部は収まらないとき）
+    missed_marks: list[bool] | None = None  # missed の語ごとに、印の語か（missed と同じ順）
 
 
 def _whisper_text(text: str) -> str:
@@ -165,6 +166,8 @@ def plan_initial_prompt(
       3. 収まらず、印の語がある → 前置きの文を入れ、優先の高い順に 1 語ずつ、合わせて max_tokens に入るなら入れる
          （入らない語は飛ばして次へ）。優先の順は 印の語 → 印の無い語、同じ印のうちでは辞書の後ろの方が先。
          並べるのは優先の低い順（印の無い語、印の語。それぞれの中は辞書の順）で、優先の高い語が後ろに来る。
+         どの語も 1 語で前置きの文と合わせて max_tokens を超えるとき（語 1 つが 200 トークンほどの、実の辞書ではまず無い
+         長さ）は、1 語も入らず、文字列は空（Whisper に prompt を渡さない。ログは「届く 0/N 語」）。
     encode が None（トークン数を数えられない）なら、全部の語を優先の低い順に並べる（印が無ければ
     build_initial_prompt と同じ文字列）。届く語は分からない（None）。
     """
@@ -203,6 +206,7 @@ def plan_initial_prompt(
         marked=n_marked,
         marked_reached=sum(1 for m, ok in zip(marks, flags) if m and ok),
         selected=selected,
+        missed_marks=[m for m, ok in zip(marks, flags) if not ok],
     )
 
 

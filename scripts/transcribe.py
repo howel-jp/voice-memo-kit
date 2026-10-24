@@ -271,7 +271,9 @@ def prompt_log_lines(plan: PromptPlan, note: str = "") -> list[str]:
     else:
         lines.append(f"[A] initial_prompt {plan.tokens}/{lim} トークン、届く {n_reach}/{plan.words} 語{marked}")
     if n_miss:
-        lines.append("  届かない語: " + "、".join(plan.missed or []))
+        # 印の語なのに入らなかった語には「（印）」を付ける（印が多すぎるとき。SKILL.md §5）
+        marks = plan.missed_marks or [False] * n_miss
+        lines.append("  届かない語: " + "、".join(w + ("（印）" if m else "") for w, m in zip(plan.missed or [], marks)))
     return lines
 
 

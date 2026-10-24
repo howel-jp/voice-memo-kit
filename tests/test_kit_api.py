@@ -103,10 +103,11 @@ class CallStyleTest(unittest.TestCase):
         self.assertIsInstance(glossary.build_initial_prompt([]), str)
         # #1: 戻り値の中身も 0.5.0 と同じ (2 つのスキルの prompt を変えない)。印 ("priority") があっても並べ替えない
         self.assertEqual(prompt, "以下は本音声で言及される固有名詞の一覧です: ゾルマ、Qantrel。")
-        marked = [{"canonical": "ゾルマ"}, {"canonical": "Qantrel", "priority": True}, {"canonical": ""},
-                  {"canonical": "ヌビト", "priority": True}]
+        # 先頭の語に印を付ける (印の語を後ろへ並べ替える変異を、この test だけで拾う。PR #11 のレビュー 1 回目の推奨 2)
+        marked = [{"canonical": "ゾルマ", "priority": True}, {"canonical": "Qantrel"}, {"canonical": ""},
+                  {"canonical": "ヌビト", "priority": True}, {"canonical": "Zemutra"}]
         self.assertEqual(glossary.build_initial_prompt(marked),
-                         "以下は本音声で言及される固有名詞の一覧です: ゾルマ、Qantrel、ヌビト。")
+                         "以下は本音声で言及される固有名詞の一覧です: ゾルマ、Qantrel、ヌビト、Zemutra。")
         self.assertEqual(glossary.build_initial_prompt([]), "")
 
         utts = [{"start": 0.0, "end": 1.0, "text": "ぞるまの件", "speaker": "合成"}]

@@ -583,6 +583,18 @@ class ProcessOnePromptTest(_ProcessOneBase):
         self.assertIn("  届かない語: " + "、".join(plan.missed), lines)
         self.assertEqual(r["keys"], self.KEYS)
 
+    def test_no_single_word_fits_passes_no_prompt(self):
+        # PR #11 のレビュー 1 回目の任意 1: 1 語も入らないときは prompt を渡さない (asr_options なし)。辞書は B・C に使う
+        entries = [{"canonical": "ア" * 300, "priority": True}, {"canonical": "イ" * 250}]
+        self._cli(lambda b: b)
+        r = self._run(entries=entries)
+        self.assertIsNone(self.whisperx.asr_options[-1])
+        self.assertIn("[A] initial_prompt 0/223 トークン（印の語を優先）、届く 0/2 語（うち印 0/1）、届かない 2 語",
+                      self._lines())
+        canon_line = self.cli_messages[-1].split("【固有名詞 canonical 一覧（最優先で守る）】\n", 1)[1].split("\n", 1)[0]
+        self.assertEqual(canon_line, "ア" * 300 + "、" + "イ" * 250)
+        self.assertEqual(r["keys"], self.KEYS)
+
     def test_not_countable_warns_and_passes_the_050_string(self):
         self.set_encoder(None, "合成の理由")
         self._cli(lambda b: b)
@@ -632,6 +644,26 @@ class PromptLogLinesTest(unittest.TestCase):
     def test_no_words_no_lines(self):
         self.assertEqual(t.prompt_log_lines(glossary.plan_initial_prompt([], char_encoder)), [])
 
+    def test_missed_marked_words_are_shown(self):
+        # PR #11 のレビュー 1 回目の任意 2: 印があっても入らなかった語は、届かない語の一覧で「（印）」が付く
+        entries = [dict(e, priority=True) for e in synth.synth_entries("L", 40, 0)] + [{"canonical": "ゾルマ" * 50}]
+        marked = {e["canonical"] for e in entries if glossary.is_priority(e)}
+        plan = glossary.plan_initial_prompt(entries, char_encoder)
+        lines = t.prompt_log_lines(plan)
+        expected = "  届かない語: " + "、".join(w + ("（印）" if w in marked else "") for w in plan.missed)
+        self.assertEqual(lines[-1], expected)
+        self.assertIn("（印）", lines[-1])
+        self.assertIn("ゾルマ" * 50, lines[-1])  # 印の無い語は届かない語の一覧にあり、「（印）」は付かない
+        self.assertNotIn("ゾルマ" * 50 + "（印）", lines[-1])
+
+    def test_no_single_word_fits_logs_an_empty_prompt(self):
+        # PR #11 のレビュー 1 回目の任意 1: 1 語も入らないときは prompt が空で、ログは「届く 0/N 語」
+        entries = [{"canonical": "ア" * 300, "priority": True}, {"canonical": "イ" * 250}]
+        lines = t.prompt_log_lines(glossary.plan_initial_prompt(entries, char_encoder))
+        self.assertEqual(lines[0], "[A] initial_prompt 0/223 トークン（印の語を優先）、届く 0/2 語（うち印 0/1）、届かない 2 語")
+        self.assertTrue(lines[1].endswith("。印の語のうち 1 語も入りません"))
+        self.assertEqual(lines[2], "  届かない語: " + "ア" * 300 + "（印）、" + "イ" * 250)
+
     def test_chunk_output_cap(self):
         # 1 チャンクの出力 ≤ min(448 − len(prompt) + 1, 224)。len(prompt) = 使う prompt + 5 (無ければ 4)
         for tokens, cap in ((0, 224), (1, 224), (220, 224), (221, 223), (222, 222), (223, 221), (620, 221)):
@@ -669,6 +701,27 @@ class PromptDocsTest(unittest.TestCase):
         self.assertIn("[WARN] initial_prompt", self.skill)
         self.assertIn('"priority": true', self.skill)
         self.assertIn("[WARN] 1 チャンクの出力が", self.skill)
+
+    def test_skill_md_separates_the_two_kinds_of_prompt_warn(self):
+        # PR #11 のレビュー 1 回目の推奨 1: SKILL.md §5 は 2 種類の [WARN] initial_prompt を分けて読む。
+        # コードの出す [WARN] initial_prompt の行が、どちらかの書き出しで始まることを結ぶ
+        over_prefix = "[WARN] initial_prompt が 223 トークン"
+        uncounted_prefix = "[WARN] initial_prompt のトークン数を数えられません"
+        self.assertIn(f"`{over_prefix}` で始まる行", self.skill)
+        self.assertIn(f"`{uncounted_prefix}` の行", self.skill)
+        self.assertIn("（印）", self.skill)
+        P = glossary.PromptPlan
+        plans = {
+            "over": (P("x", 620, 78, ["w"] * 28, ["v"] * 50, False, 0, 0, False), over_prefix),
+            "prefix_only": (P("x", 230, 2, ["w"] * 2, [], False, 0, 0, False), over_prefix),
+            "selected": (P("x", 220, 40, ["w"] * 15, ["v"] * 25, True, 40, 15, True), over_prefix),
+            "uncounted": (P("x", None, 78, None, None, None, 0, None, False), uncounted_prefix),
+        }
+        for name, (plan, prefix) in plans.items():
+            warns = [ln.strip() for ln in t.prompt_log_lines(plan, "合成の理由") if "[WARN] initial_prompt" in ln]
+            with self.subTest(name=name):
+                self.assertEqual(len(warns), 1)
+                self.assertTrue(warns[0].startswith(prefix), warns[0])
 
 
 class HeadingDocsTest(unittest.TestCase):

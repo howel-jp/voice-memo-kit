@@ -183,17 +183,32 @@ class PlanInitialPromptTest(unittest.TestCase):
         body = p.text[len(g.PROMPT_PREFIX):-1].split("、")
         self.assertEqual(body, [w for w in words if w in p.reached and w not in marked_words] + marked_words)
         self.assertEqual(sorted(p.reached + p.missed), sorted(words))
+        self.assertEqual(p.missed_marks, [False] * len(p.missed))  # 届かない語に印の語は無い
 
     def test_too_many_marks_prefers_later_marked_words(self):
-        # 長い語に全部印を付けると全部は入らない。印の語の中では辞書の後ろの方が先 (入らない語は飛ばして次へ)
-        entries = [dict(e, priority=True) for e in synth.synth_entries("L", 40, 0)]
+        # 長い語に印を付けすぎると全部は入らない。印の語の中では辞書の後ろの方が先 (入らない語は飛ばして次へ)
+        entries = [dict(e, priority=True) for e in synth.synth_entries("L", 40, 0)] + [{"canonical": "ゾルマ" * 50}]
         words = [e["canonical"] for e in entries]
+        marks = [g.is_priority(e) for e in entries]
         p = g.plan_initial_prompt(entries, char_encoder)
         self.assertTrue(p.selected)
         self.assertLess(p.marked_reached, 40)
-        self.assertIn(words[-1], p.reached)
-        self.assertEqual(set(p.reached), {words[i] for i in greedy_expected(words, [True] * 40)})
+        self.assertIn(words[-2], p.reached)  # 印の語のうち辞書の最後
+        self.assertEqual(set(p.reached), {words[i] for i in greedy_expected(words, marks)})
         self.assertLessEqual(p.tokens, LIMIT)
+        # 届かない語ごとの印 (missed と同じ順)。印の無い長い語は印の語の後回しで入らず、印は False
+        self.assertEqual(p.missed_marks, [marks[words.index(w)] for w in p.missed])
+        self.assertIn("ゾルマ" * 50, p.missed)
+        self.assertFalse(p.missed_marks[p.missed.index("ゾルマ" * 50)])
+        self.assertTrue(any(p.missed_marks))
+
+    def test_no_single_word_fits_gives_an_empty_prompt(self):
+        # PR #11 のレビュー 1 回目の任意 1: どの語も 1 語で前置きと合わせて 223 を超えるときは、1 語も入らず空
+        entries = [{"canonical": "ア" * 300, "priority": True}, {"canonical": "イ" * 250}]
+        p = g.plan_initial_prompt(entries, char_encoder)
+        self.assertTrue(p.selected)
+        self.assertEqual((p.text, p.tokens, p.reached, p.missed), ("", 0, [], ["ア" * 300, "イ" * 250]))
+        self.assertEqual((p.marked, p.marked_reached, p.missed_marks), (1, 0, [True, False]))
 
     def test_skips_a_word_that_does_not_fit_and_tries_the_next(self):
         # 1 字 1 トークンで、" " + 前置き + 「。」 が base トークン。優先の高い順に カ*100 (入る)、キ*100 (入らない)、ク*5 (入る)
