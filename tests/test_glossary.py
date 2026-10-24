@@ -195,6 +195,26 @@ class PlanInitialPromptTest(unittest.TestCase):
         self.assertEqual(set(p.reached), {words[i] for i in greedy_expected(words, [True] * 40)})
         self.assertLessEqual(p.tokens, LIMIT)
 
+    def test_skips_a_word_that_does_not_fit_and_tries_the_next(self):
+        # 1 字 1 トークンで、" " + 前置き + 「。」 が base トークン。優先の高い順に カ*100 (入る)、キ*100 (入らない)、ク*5 (入る)
+        base = 1 + len(g.PROMPT_PREFIX) + 1
+        self.assertGreater(base + 100 + 1 + 100, LIMIT)
+        entries = [{"canonical": "ク" * 5, "priority": True}, {"canonical": "キ" * 100, "priority": True},
+                   {"canonical": "カ" * 100, "priority": True}]
+        p = g.plan_initial_prompt(entries, char_encoder)
+        self.assertTrue(p.selected)
+        self.assertEqual(p.reached, ["ク" * 5, "カ" * 100])  # キ*100 は飛ばし、次の ク*5 を入れる
+        self.assertEqual(p.missed, ["キ" * 100])
+        self.assertEqual(p.tokens, base + 5 + 1 + 100)
+
+    def test_exactly_223_tokens_fits(self):
+        # 印の語 1 つでちょうど 223 トークン (" " + 前置き + 語 + 「。」) になるときも入れる
+        n = LIMIT - (1 + len(g.PROMPT_PREFIX) + 1)
+        entries = [{"canonical": "ア" * 10}, {"canonical": "イ" * n, "priority": True}]
+        p = g.plan_initial_prompt(entries, char_encoder)
+        self.assertTrue(p.selected)
+        self.assertEqual((p.tokens, p.reached, p.missed), (223, ["イ" * n], ["ア" * 10]))
+
     def test_without_encoder_marks_go_last_and_counts_are_unknown(self):
         p = g.plan_initial_prompt(self.MIXED78, None)
         self.assertEqual(p.text, g.build_initial_prompt(self.MIXED78))
