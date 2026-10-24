@@ -246,9 +246,11 @@ MIN_LENGTH_RATIO = 0.6
 
 _PARAGRAPH_SPLIT_RE = re.compile(r"\n\s*\n")
 
-# 文の終わり: 。！？!? （後ろに閉じ括弧が続いてもよい）
+# 文の終わり: 。！？!? （後ろに閉じ括弧・閉じ引用符が続いてもよい）
 SENTENCE_END_CHARS = "。！？!?"
-CLOSING_CHARS = "」』）)】"
+CLOSING_CHARS = "」』）)】〕〉》”’"
+# 末尾の確かめで、校閲後の末尾としてだけ認める印（校閲が「。」を「…」に替えることがある。分ける境目には使わない）
+OUTPUT_END_EXTRA_CHARS = "…‥"
 
 
 def count_paragraphs(text: str) -> int:
@@ -259,12 +261,15 @@ def count_paragraphs(text: str) -> int:
     return len([p for p in _PARAGRAPH_SPLIT_RE.split(_normalize_newlines(text).strip()) if p.strip()])
 
 
-def ends_with_sentence_end(text: str) -> bool:
-    """末尾 (空白を除く) が文の終わり (。！？!? の後に閉じ括弧が続いてもよい) か。"""
+def ends_with_sentence_end(text: str, extra: str = "") -> bool:
+    """末尾 (空白を除く) が文の終わり (。！？!? の後に閉じ括弧・閉じ引用符が続いてもよい) か。
+
+    extra は、文の終わりとして足して認める字 (末尾の確かめで、校閲後の側にだけ OUTPUT_END_EXTRA_CHARS を渡す)。
+    """
     t = text.rstrip()
     while t and t[-1] in CLOSING_CHARS:
         t = t[:-1]
-    return bool(t) and t[-1] in SENTENCE_END_CHARS
+    return bool(t) and t[-1] in SENTENCE_END_CHARS + extra
 
 
 def _as_int(value) -> int | None:
@@ -314,7 +319,7 @@ def check_result(
             f"校閲後の段落が減っています（{n_in} → {n_out}）。一部が欠けた疑いがあるため校閲前の文字起こしを使います",
             detail=f"段落 {n_in} → {n_out}",
         )
-    if check_end and ends_with_sentence_end(body) and not ends_with_sentence_end(cleaned):
+    if check_end and ends_with_sentence_end(body) and not ends_with_sentence_end(cleaned, OUTPUT_END_EXTRA_CHARS):
         raise ProofreadIncomplete(
             "校閲後の末尾が文の終わりではありません（入力は文の終わりで終わる）。"
             "切れたか注記が足された疑いがあるため校閲前の文字起こしを使います",
@@ -336,7 +341,7 @@ KIND_SOFT = 4  # 「、」・空白
 KIND_HARD = 5  # どれも無い（目安の位置で切る）
 
 _PARAGRAPH_SEP_RE = re.compile(r"\n\s*\n")
-_SENTENCE_END_RE = re.compile(r"[。！？!?]+[」』）)】]*")
+_SENTENCE_END_RE = re.compile(f"[{re.escape(SENTENCE_END_CHARS)}]+[{re.escape(CLOSING_CHARS)}]*")
 _SOFT_BREAK_RE = re.compile(r"[、，,]|\s")
 
 
@@ -389,7 +394,8 @@ def split_into_chunks(text: str, max_chars: int = CHUNK_CHARS) -> list[Chunk]:
     まとまりの数は ⌈字数 / max_chars⌉ で、大きさをそろえる (目安の位置 = 残りの字数 / 残りのまとまりの数)。
     境目は、目安の ±max_chars/4 (まとまりが max_chars を超えない範囲) の中で、種類の良い順 (KIND_*)、
     同じ種類なら目安に近い所。まとまりの数が増えない位置 (残りが、残りのまとまりの数に収まる位置) を先に探し、
-    無ければ数が増えるのを許す。その範囲に無ければ max_chars までの範囲で同じ順。どれも無ければ目安の位置で切る。
+    無ければ数が増えるのを許す。その範囲に無ければ max_chars/4〜max_chars の範囲で同じ順。どの候補も、残りが
+    max_chars/4 より短くなる所は除く (小さいまとまりを作らない)。どれも無ければ目安の位置で切る。
     """
     if max_chars < 1:
         raise ValueError("max_chars は 1 以上")
@@ -403,11 +409,14 @@ def split_into_chunks(text: str, max_chars: int = CHUNK_CHARS) -> list[Chunk]:
         ideal = start + (len(text) - start) / n_rest
         limit = start + max_chars
         need = len(text) - (n_rest - 1) * max_chars  # これより前で切ると、まとまりが 1 つ増える
-        lo, hi = max(start + 1, ideal - max_chars / 4), min(ideal + max_chars / 4, limit)
+        # 小さいまとまりは比のガードに当たりやすいので作らない: 前から max_chars/4 より前と、残りが max_chars/4 より
+        # 短くなる所では切らない
+        floor, ceil_ = start + max_chars / 4, min(limit, len(text) - max_chars / 4)
+        lo, hi = max(floor, ideal - max_chars / 4), min(ideal + max_chars / 4, ceil_)
         best = (_pick(points, max(lo, need), hi, ideal)
-                or _pick(points, max(start + 1, need), limit, ideal)
+                or _pick(points, max(floor, need), ceil_, ideal)
                 or _pick(points, lo, hi, ideal)
-                or _pick(points, start + 1, limit, ideal))
+                or _pick(points, floor, ceil_, ideal))
         pos, kind, sep_len = best if best else (min(limit, max(start + 1, need, int(ideal))), KIND_HARD, 0)
         chunks.append(Chunk(text[start:pos], sep, kind_before))
         sep, kind_before, start = text[pos:pos + sep_len], kind, pos + sep_len

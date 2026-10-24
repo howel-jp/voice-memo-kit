@@ -56,8 +56,12 @@ Get-ChildItem voice_memos\inbox, "$env:USERPROFILE\voice_memos\inbox" -File -Err
 - 出力は `voice_memos/transcripts/<録音日>_<元ファイル名>.md`、音声は見つかった層の `processed/` へ自動退避。
 - **注意**: `2>&1 | Select-String` 等で stderr を混ぜると、ライブラリ警告が終了エラー扱いされ途中中断する
   ことがある。**素直にそのまま実行**するか、出力を `| Out-String` で受ける。成否は終了コードと transcript 生成有無で判断する。
-- 音声が長いとき（目安 30 分以上）は終わるまで 10 分を超えることがある（長い文字起こしは分けて順に校閲するため）。
-  前面の timeout の上限を超えそうなら、バックグラウンドで実行し、終わってから §3 へ進む。
+- 音声が長いとき（目安 30 分以上。CPU で動かすとき（`--device cpu` か `whisper.device: cpu`）は文字起こしに実時間の約 1.4 倍かかるので、
+  もっと短い音声でも）は、終わるまで 10 分を超えることがある（長い文字起こしは分けて順に校閲するため）。
+  前面の timeout の上限（10 分）を超えそうなら、上のコマンドを Bash / PowerShell の道具の `run_in_background` で実行し、
+  道具の終わりの通知（ランチャーの終了コードと出力）を待ってから §3 へ進む。通知の前に終わりを確かめるなら、ランチャーの出力の
+  `完了: n/n 件` か、`voice_memos/transcripts/` に今回の md ができたことを見る。`Start-Job`・`Start-Process` などで切り離さない
+  （出力と終了コードを見失う）。
 - 文字起こし自体が失敗した場合（GPU 不調等）は `--device cpu` を案内、またはユーザーに状況を伝える。
   GPU の無い PC で常用するなら `voice_memos/config.json` に `{"whisper": {"device": "cpu"}}` を書く（実時間の約 1.4 倍かかる）。
 - 上のパス変数が展開されず `${CLAUDE_PLUGIN_ROOT}` のまま見える場合（プラグインではなく個人スキルとして読み込まれている）は、

@@ -339,9 +339,23 @@ def _memo(n_paras: int, seed: int = 0, sents: tuple[int, int] = (3, 9)) -> str:
 class EndsWithSentenceEndTest(unittest.TestCase):
     def test_sentence_end(self):
         for text, expected in (("あ。", True), ("あ。」", True), ("あ！）", True), ("あ?", True), ("あ。  \n", True),
-                               ("あ」", False), ("あ", False), ("", False), ("あ、", False), ("あ…", False)):
+                               ("あ」", False), ("あ", False), ("", False), ("あ、", False), ("あ…", False),
+                               # PR #10 のレビュー 1 回目の任意 2: 閉じ引用符・ほかの閉じ括弧
+                               ("あ。”", True), ("あ。’", True), ("あ。〕", True), ("あ！〉", True), ("あ？》", True),
+                               ("あ。」”", True), ("あ”", False)):
             with self.subTest(text=text):
                 self.assertIs(p.ends_with_sentence_end(text), expected)
+        self.assertTrue(p.ends_with_sentence_end("あ…", p.OUTPUT_END_EXTRA_CHARS))
+        self.assertTrue(p.ends_with_sentence_end("あ…」", p.OUTPUT_END_EXTRA_CHARS))
+
+    def test_check_end_accepts_changed_closing_marks_and_ellipsis(self):
+        # 校閲が閉じ括弧や句点を替えただけのものは、末尾の確かめで捨てない (#3 §4「今より悪くならない」)
+        body = "「合成の文です。」" * 20
+        for tail in ("“合成の文です。”", "〔合成の文です。〕", "合成の文です…", "「合成の文です…」"):
+            with self.subTest(tail=tail):
+                p.check_result(body, "「合成の文です。」" * 19 + tail, check_end=True)
+        with self.assertRaises(p.ProofreadIncomplete):  # 切れた形は今どおり見つける
+            p.check_result(body, body[:-3], check_end=True)
 
     def test_check_end_is_off_by_default_and_runs_last(self):
         body = "合成の文です。" * 20
@@ -401,6 +415,23 @@ class SplitIntoChunksTest(unittest.TestCase):
             self.assertTrue(c.text.startswith("「"), c.text[:3])  # 「。」と「」」の間で切らない
         for c in chunks[:-1]:
             self.assertTrue(c.text.endswith("。」"), c.text[-3:])
+        body = "“それでいいです。”" * 700  # 閉じ引用符 (PR #10 のレビュー 1 回目の任意 2)
+        chunks = p.split_into_chunks(body)
+        self._check_lossless(body, chunks)
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(c.text.startswith("“") for c in chunks[1:]))
+
+    def test_no_tiny_chunk_when_the_window_has_no_cut_point(self):
+        # PR #10 のレビュー 1 回目の任意 1: 目安の ±750 字に切る位置が無いとき、先頭の直後の良い位置で切らない
+        for body in ("。" + "あ" * 5000, "あ" * 10 + "。\n\n" + "い" * 7000, "う" * 3200 + "。" + "え" * 3200,
+                     "お" * 2999 + "。" + "か" * 480):  # 最後の例: 3,000 字目で切ると、残りが 480 字になる
+            with self.subTest(body=body[:12]):
+                chunks = p.split_into_chunks(body)
+                self._check_lossless(body, chunks)
+                # 文の途中で切るより、まとまりが 1 つ増えても文の終わりで切る (3 つ目の本文)
+                n = math.ceil(len(body) / self.MAX)
+                self.assertIn(len(chunks), (n, n + 1))
+                self.assertGreaterEqual(min(len(c.text) for c in chunks), self.MAX // 4)
 
     def test_sentence_end_is_preferred_over_paragraph_boundary_without_it(self):
         # 段落の末尾に句点が無い (文の途中の無音で分かれた形) ときは、段落の中の文の終わりで切る
@@ -435,7 +466,8 @@ class SplitIntoChunksTest(unittest.TestCase):
             text = text[: rng.randint(2, len(text))]
             with self.subTest(trial=trial):
                 parts = p.split_in_two(text)
-                self.assertEqual(len(parts), 2 if len(text) > 1 else 1)  # やり直しの呼び出しは 2 回まで
+                # やり直しの呼び出しは 2 回まで。2 字以下は分けない (上限が ⌈2 × 3/5⌉ = 2 字。レビュー 1 回目の任意 5)
+                self.assertEqual(len(parts), 2 if len(text) > 2 else 1)
                 self.assertEqual("".join(c.sep + c.text for c in parts), text)
 
     def test_random_bodies_are_lossless_and_bounded(self):
@@ -449,7 +481,8 @@ class SplitIntoChunksTest(unittest.TestCase):
                 body = rng.choice(["\n\n", "\n \n", "\n\n\n"]).join(paras)
                 chunks = p.split_into_chunks(body)
                 self._check_lossless(body, chunks)
-                # 目安は ⌈字数/3,000⌉。境目の種類を優先するので、合計が 3,000 の倍数に近いと 1 つ増えることがある
+                # 目安は ⌈字数/3,000⌉。ある境目で、数が増えない範囲 (need〜上限) に切る位置が無いときは 1 つ増える。
+                # 合計が 3,000 の倍数に近いとその範囲が狭い (前の境目で目安より前を選ぶと、さらに狭くなる)
                 n = math.ceil(len(body) / self.MAX)
                 self.assertIn(len(chunks), (n, n + 1))
                 self.assertGreaterEqual(min(len(c.text) for c in chunks), self.MAX // 4)
