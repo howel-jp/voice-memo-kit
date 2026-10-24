@@ -266,7 +266,8 @@ def prompt_log_lines(plan: PromptPlan, note: str = "") -> list[str]:
             warn = (f"  [WARN] initial_prompt が {lim} トークンに収まらないため、{n_miss} 語は Whisper に予告しません"
                     "（置き換えと校閲には使います）")
             if (plan.marked_reached or 0) < plan.marked:
-                warn += f"。印の語のうち {plan.marked - (plan.marked_reached or 0)} 語も入りません"
+                # 「N 語も」は N が 1 のとき「1 語も入らない (= どれも入らない)」と読めるので「は」にする (PR #11 のレビュー 2 回目)
+                warn += f"。印の語のうち {plan.marked - (plan.marked_reached or 0)} 語は入りません"
             lines.append(warn)
     else:
         lines.append(f"[A] initial_prompt {plan.tokens}/{lim} トークン、届く {n_reach}/{plan.words} 語{marked}")

@@ -639,7 +639,15 @@ class PromptLogLinesTest(unittest.TestCase):
         plan = glossary.PromptPlan("合成", 220, 40, ["A"] * 15, ["B"] * 25, True, 40, 15, True)
         lines = t.prompt_log_lines(plan)
         self.assertEqual(lines[0], "[A] initial_prompt 220/223 トークン（印の語を優先）、届く 15/40 語（うち印 15/40）、届かない 25 語")
-        self.assertTrue(lines[1].endswith("。印の語のうち 25 語も入りません"))
+        self.assertTrue(lines[1].endswith("。印の語のうち 25 語は入りません"))
+
+    def test_one_missed_marked_word_does_not_read_as_none_reached(self):
+        # PR #11 のレビュー 2 回目の任意 1: 入らない印の語が 1 語のとき「1 語も入りません」(= どれも入らない) と読めない文にする
+        plan = glossary.PromptPlan("合成", 222, 40, ["A"] * 37, ["B"] * 3, True, 38, 37, True)
+        lines = t.prompt_log_lines(plan)
+        self.assertIn("（うち印 37/38）", lines[0])
+        self.assertTrue(lines[1].endswith("。印の語のうち 1 語は入りません"), lines[1])
+        self.assertNotIn("語も入りません", lines[1])
 
     def test_no_words_no_lines(self):
         self.assertEqual(t.prompt_log_lines(glossary.plan_initial_prompt([], char_encoder)), [])
@@ -661,7 +669,7 @@ class PromptLogLinesTest(unittest.TestCase):
         entries = [{"canonical": "ア" * 300, "priority": True}, {"canonical": "イ" * 250}]
         lines = t.prompt_log_lines(glossary.plan_initial_prompt(entries, char_encoder))
         self.assertEqual(lines[0], "[A] initial_prompt 0/223 トークン（印の語を優先）、届く 0/2 語（うち印 0/1）、届かない 2 語")
-        self.assertTrue(lines[1].endswith("。印の語のうち 1 語も入りません"))
+        self.assertTrue(lines[1].endswith("。印の語のうち 1 語は入りません"))
         self.assertEqual(lines[2], "  届かない語: " + "ア" * 300 + "（印）、" + "イ" * 250)
 
     def test_chunk_output_cap(self):
@@ -701,6 +709,16 @@ class PromptDocsTest(unittest.TestCase):
         self.assertIn("[WARN] initial_prompt", self.skill)
         self.assertIn('"priority": true', self.skill)
         self.assertIn("[WARN] 1 チャンクの出力が", self.skill)
+
+    def test_missed_marked_words_tail_is_the_same_in_code_and_docs(self):
+        # PR #11 のレビュー 2 回目の任意 1: 「印の語のうち N 語は入りません」を、コード・SKILL.md §5・README で同じ文にする
+        plan = glossary.PromptPlan("x", 222, 40, ["w"] * 37, ["v"] * 3, True, 38, 37, True)
+        warn = t.prompt_log_lines(plan)[1]
+        tail = warn[warn.rindex("。") + 1:]
+        self.assertEqual(tail, "印の語のうち 1 語は入りません")
+        for doc in (self.skill, self.readme):
+            self.assertIn("`印の語のうち N 語は入りません`", doc)
+            self.assertNotIn("語も入りません", doc)
 
     def test_skill_md_separates_the_two_kinds_of_prompt_warn(self):
         # PR #11 のレビュー 1 回目の推奨 1: SKILL.md §5 は 2 種類の [WARN] initial_prompt を分けて読む。
