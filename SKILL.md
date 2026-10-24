@@ -80,9 +80,17 @@ Get-ChildItem voice_memos\inbox, "$env:USERPROFILE\voice_memos\inbox" -File -Err
 実行後、`voice_memos/transcripts/` で**今回生成された md**（更新時刻が最新のもの／§1 で把握した対象に対応するもの）を Read で読む。複数あれば全部。
 
 各 md の構成:
-- frontmatter（`date / source / duration / engine / segments / glossary_replacements / proofread`）
-- 本文（校閲後テキスト）
-- `<details>校閲前（文字起こし生データ）</details>`（必要なときだけ参照。原則は本文＝校閲後を使う）
+- frontmatter（`date / source / duration / engine / segments / glossary_replacements / proofread`。校閲に失敗したときだけ、続けて `proofread_error / proofread_error_detail`）
+  - `proofread`: 本文が Claude で校閲された文ならモデル名。`false` なら本文は校閲されていない（校閲しない設定、文字起こしが空、または校閲に失敗）
+  - `proofread_error`: 校閲を試みたが結果を使わなかった理由。`timeout`（時間切れ）/ `cli_error`（Claude CLI のエラー）/ `empty`（空の結果）/ `too_short`（短すぎる＝要約の疑い）/ `incomplete`（一部が欠けた疑い）/ `error`（その他）。`proofread_error_detail` は数などの補足 1 行
+- 本文: `proofread` がモデル名なら校閲後。`false` なら校閲前の文字起こし（辞書の置き換え後）
+- `<details>校閲前（辞書の置き換え後）</details>`: 校閲に渡した文。本文が校閲後のときだけ付く（`false` のときは本文と同じなので付かない）
+- `<details>置き換え前（Whisper の出力）</details>`: 辞書の置き換え（wrong_variants → canonical）の前の文。置き換えが 1 箇所以上あったときだけ付く。
+  `glossary_replacements: 0` なら置き換え前の文は、`proofread: false` のときは本文と、校閲されたときは校閲前の節と同じ
+- `<details>` は必要なときだけ参照する。原則は本文を使う
+
+`proofread_error` があるときは、校閲に失敗したことと理由を利用者に 1 行で伝え（例:「校閲が時間切れになったので、校閲前の文字起こしで読みます」）、
+本文を校閲されていない文として読む（誤変換・固有名詞・数値をより慎重に扱う）。
 
 ## 4. 内容を「ユーザーからの入力」として解釈し、会話を始める（核心）
 
@@ -107,11 +115,13 @@ Get-ChildItem voice_memos\inbox, "$env:USERPROFILE\voice_memos\inbox" -File -Err
   （canonical の確定はユーザーの領分）。置き場所は、そのプロジェクト固有の語なら `voice_memos/glossary/*.json`、
   人名など PC 全体で使う語なら `~/voice_memos/glossary/*.json`。
   wrong_variants は実際に観測された誤認識のみ追加する（仮想的な誤りは過剰置換のリスク）。
-- どうしても聞き取れない箇所は `<details>` の校閲前データも見て突き合わせる。それでも不明ならユーザーに確認。
+- どうしても聞き取れない箇所は `<details>` の校閲前の文も見て突き合わせる。それでも不明ならユーザーに確認。
+- 辞書の置き換えの誤り（正しい語まで canonical に置き換えた等）を疑うときは、「置き換え前」の節（置き換えがあったときだけ付く）と突き合わせる。
+  誤りなら、その wrong_variants を辞書から外すことを**提案**する。
 
 ## 失敗時のフォールバック
 
 - inbox 空 & 引数なし → 音声の配置/パス指定を案内して終了。
 - venv が見つからない（exit 2） → §2「初回セットアップ」の手順で `setup.ps1` を実行。
-- 校閲（Claude CLI）だけ失敗 → ツールは生の文字起こしを保持してフォールバックするので、本文（校閲前）で続行。
+- 校閲（Claude CLI）だけ失敗 → ツールは校閲前の文字起こし（辞書の置き換え後）を本文にして保存する（`proofread: false`、理由は `proofread_error`）。§3 のとおり利用者に 1 行伝えて、本文で続行。
 - 文字起こし内容が空/ノイズのみ → その旨を伝え、録り直しを提案。

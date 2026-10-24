@@ -6,7 +6,7 @@
 
 - 文字起こし: WhisperX `large-v3`（INT8 / CUDA）。単語整列は省略して高速化
 - 固有名詞補正: プロジェクト別の辞書（JSON）で initial_prompt 予告＋誤認識置換の二段補正
-- 校閲: Claude Code CLI（サブスクリプション容量内・追加課金なし）。校閲前データも md 内に保持
+- 校閲: Claude Code CLI（サブスクリプション容量内・追加課金なし）。校閲前の文と、辞書の置き換え前の文（置き換えがあったとき）も md 内に保持
 - 出力: `<project>/voice_memos/transcripts/<録音日>_<元ファイル名>.md`
 
 📝 紹介記事（入れ方・使い方を順に説明）: [ボイスメモをそのままClaude Codeの指示にするスキル｜note](https://note.com/trinity_nexus/n/n7ac7edfae794)
@@ -133,7 +133,17 @@ powershell -NoProfile -File tests\test_launcher.ps1
 CPU のみでも動く（同条件の実測: i7-10700F でモデル読込 16 秒、推論 201 秒 ＝ 実時間の 1.4 倍）。GPU の無い PC では
 `voice_memos/config.json` に `{"whisper": {"device": "cpu"}}` を書いておくと毎回 `--device cpu` を付けずに済む。
 
-安全ガード: 校閲結果が入力の 60% 未満の長さになった場合は「要約・欠落の疑い」として棄却し、生の文字起こしを採用する（frontmatter の `proofread: false` で判別できる）。
+安全ガード: 校閲の結果が次のどれかに当たると使わず、校閲前の文字起こし（辞書の置き換え後）を本文にする。
+frontmatter の `proofread: false` と、理由の `proofread_error`（補足は `proofread_error_detail`）で判別できる。
+
+| `proofread_error` | 当たるもの |
+|---|---|
+| `empty` | 空の結果 |
+| `too_short` | 入力の 60% 未満の長さ（要約・欠落の疑い） |
+| `incomplete` | 一部が欠けた疑い: Claude CLI が 1 回の応答で返さなかった（JSON の `num_turns` が 1 でない）、または段落（空行区切り）の数が入力より減った |
+| `timeout` / `cli_error` / `error` | 時間切れ（900 秒）/ Claude CLI のエラー / その他 |
+
+出力 md の `<details>`: 「校閲前（辞書の置き換え後）」は本文が校閲後のときだけ、「置き換え前（Whisper の出力）」は辞書の置き換えが 1 箇所以上あったときだけ付く（構成の詳細は `SKILL.md` §3）。
 
 ## ロードマップ
 

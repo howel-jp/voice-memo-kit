@@ -239,6 +239,28 @@ class TranscriptStatsPrivacyTest(unittest.TestCase):
         self.assertEqual((q["seconds"], q["source"], ts.count_chars(q["text"])), (60, "body", len("ZQX生の本文")))
         self.assertIsNone(ts.parse_transcript("no frontmatter"))
 
+    # 0.4.0 (#8) の形: 校閲前の見出しが「校閲前（辞書の置き換え後）」になり、置き換えがあれば「置き換え前」の節が付く
+    MD_NEW_OK = (
+        "---\ndate: 2026-01-03\nsource: zq-new.m4a\nduration: 02:00\nengine: x\nsegments: 2\n"
+        "glossary_replacements: 1\nproofread: claude-sonnet-4-6\n---\n\n# ボイスメモ 2026-01-03\n\n"
+        "ZQX校閲後\n\n\n<details>\n<summary>校閲前（辞書の置き換え後）</summary>\n\nZQX置き換え後の文\n\n</details>\n"
+        "\n\n<details>\n<summary>置き換え前（Whisper の出力）</summary>\n\nZQX置換前の文\n\n</details>\n"
+    )
+    MD_NEW_FAILED = (
+        "---\ndate: 2026-01-04\nsource: zq-new2.m4a\nduration: 01:00\nengine: x\nsegments: 1\n"
+        "glossary_replacements: 1\nproofread: false\nproofread_error: timeout\n"
+        "proofread_error_detail: \"900 秒で返らなかった\"\n---\n\n# ボイスメモ 2026-01-04\n\n"
+        "ZQX置き換え後の文\n\n\n<details>\n<summary>置き換え前（Whisper の出力）</summary>\n\nZQX置換前の文\n\n</details>\n"
+    )
+
+    def test_new_format_counts_the_text_given_to_proofread_once(self):
+        p = ts.parse_transcript(self.MD_NEW_OK)
+        self.assertEqual((p["proofread"], p["source"], ts.count_chars(p["text"])),
+                         (True, "details", len("ZQX置き換え後の文")))
+        q = ts.parse_transcript(self.MD_NEW_FAILED)
+        self.assertEqual((q["proofread"], q["source"], ts.count_chars(q["text"])),
+                         (False, "body", len("ZQX置き換え後の文")))  # 置き換え前の節は数えない
+
     def test_output_has_numbers_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp) / "zq-proj" / "voice_memos" / "transcripts"
@@ -311,8 +333,16 @@ class ProofreadTimingTest(unittest.TestCase):
         self.assertNotIn("error_result_head", ok)  # 成功のときは result を入れない
 
     def test_empty_result_is_flagged(self):
+        # #3 §2 の 6a: 0.3.3 までは空の結果で元の本文が返った。0.4.0 からは ProofreadEmpty で棄却される (#8)
         row, out = pt.measure_one(self.BODY, [], "m", 10.0, real_run=self._fake_run("", []))
-        self.assertTrue(row["returned_input_unchanged"])  # #3 §2 の 6a: 空の結果は元の本文が返る
+        self.assertEqual((row["status"], row["error"], out), ("rejected", "ProofreadEmpty", ""))
+        self.assertFalse(row["returned_input_unchanged"])
+
+    def test_incomplete_result_is_rejected(self):
+        # #4 の U4 run1 の形 (前の段落が無い) は、比のガードを通っても棄却される (#8)
+        row, out = pt.measure_one(self.BODY, [], "m", 10.0,
+                                  real_run=self._fake_run("あの、二つ目の段落です。" * 40, []))  # 比 0.69
+        self.assertEqual((row["status"], row["error"], out), ("rejected", "ProofreadIncomplete", ""))
 
     def test_timeout_and_rejected(self):
         row, _ = pt.measure_one(self.BODY, [], "m", 1.0, real_run=self._fake_run("", [], raise_timeout=True))
