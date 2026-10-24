@@ -481,12 +481,60 @@ class SplitIntoChunksTest(unittest.TestCase):
                 body = rng.choice(["\n\n", "\n \n", "\n\n\n"]).join(paras)
                 chunks = p.split_into_chunks(body)
                 self._check_lossless(body, chunks)
-                # 目安は ⌈字数/3,000⌉。ある境目で、数が増えない範囲 (need〜上限) に切る位置が無いときは 1 つ増える。
-                # 合計が 3,000 の倍数に近いとその範囲が狭い (前の境目で目安より前を選ぶと、さらに狭くなる)
+                # 目安は ⌈字数/3,000⌉。ある境目で、数が増えない範囲 (need〜上限) に文の終わりが無いときは、
+                # 数が増えても文の終わりで切る。合計が 3,000 の倍数に近いとその範囲が狭い
+                # (前の境目で目安より前を選ぶと、さらに狭くなる)
                 n = math.ceil(len(body) / self.MAX)
                 self.assertIn(len(chunks), (n, n + 1))
                 self.assertGreaterEqual(min(len(c.text) for c in chunks), self.MAX // 4)
-                self.assertTrue({c.kind for c in chunks[1:]} <= {1, 2})  # 文の終わりがあれば、ほかで切らない
+                self.assertTrue({c.kind for c in chunks[1:]} <= {1, 2})  # どの段落も文の終わりで終わる本文
+                self._assert_no_cut_inside_sentence(body, chunks)
+
+    def _assert_no_cut_inside_sentence(self, text: str, chunks: list) -> None:
+        """どの境目も、切ってよい範囲 (前から MAX/4 以上、残りが MAX/4 以上) に文の終わりがあれば、種類 3〜5 で切っていない。"""
+        sentence_points = [pos for pos, kind, _ in p._cut_points(text) if kind in (1, 2)]
+        start = 0
+        for prev, c in zip(chunks, chunks[1:]):
+            pos = start + len(prev.text)
+            if c.kind not in (1, 2):
+                lo, hi = start + self.MAX / 4, min(start + self.MAX, len(text) - self.MAX / 4)
+                self.assertEqual([q for q in sentence_points if lo <= q <= hi], [], (c.kind, pos))
+            start = pos + len(c.sep)
+
+    def test_no_cut_inside_a_sentence_when_a_sentence_end_is_allowed(self):
+        # PR #10 のレビュー 2 回目の任意 1: まとまりの数を守るために、少し前に「。」があるのに「、」で切らない
+        rng = random.Random(2)
+        kinds_seen = set()
+        for trial in range(150):
+            with self.subTest(trial=trial):
+                paras = []
+                target = rng.randint(self.MAX + 1, self.MAX * 6)
+                while sum(map(len, paras)) < target:
+                    r = rng.random()
+                    if r < 0.15:
+                        paras.append("あ" * rng.randint(100, 2000))  # 句読点の無い連続
+                    elif r < 0.3:
+                        paras.append("い、" * rng.randint(30, 600))  # 読点だけ
+                    else:  # 45% は文の途中で終わる段落
+                        pa = _memo(rng.randint(1, 15), seed=rng.randint(0, 999)).replace("\n\n", "")
+                        paras.append(pa + ("えーと" if rng.random() < 0.45 else ""))
+                body = "\n\n".join(paras)
+                if trial % 3 == 0:  # 合計を 3,000 の倍数の近くにする (数が増えない範囲が狭い形)
+                    k = max(2, round(len(body) / self.MAX))
+                    body = body[: k * self.MAX + rng.randint(-40, 40)].rstrip()
+                chunks = p.split_into_chunks(body)
+                self._check_lossless(body, chunks)
+                self._assert_no_cut_inside_sentence(body, chunks)
+                kinds_seen.update(c.kind for c in chunks[1:])
+        self.assertTrue({3, 4} & kinds_seen)  # 文の終わりが無い所では、種類 3・4 で切る場面も通っている
+
+    def test_whitespace_at_a_boundary_is_the_separator(self):
+        # PR #10 のレビュー 2 回目の任意 2: 空白は区切りにして、まとまりの前後に残さない
+        body = ("Qantrel " * 500).rstrip()
+        chunks = p.split_into_chunks(body)
+        self._check_lossless(body, chunks)
+        self.assertEqual({(c.kind, c.sep) for c in chunks[1:]}, {(p.KIND_SOFT, " ")})
+        self.assertTrue(all(c.text == c.text.strip() for c in chunks))
 
 
 class _ChunkStub:
@@ -551,6 +599,19 @@ class ChunkedProofreadTest(_Patched):
         self.assertGreater(len(stub.bodies), 1)
         self.assertEqual(out, self.body.replace("えーと、", ""))
         self.assertEqual(p.count_paragraphs(out), 1)
+
+    def test_whitespace_at_a_boundary_is_kept(self):
+        # PR #10 のレビュー 2 回目の任意 2: 空白で切ると、つないだ校閲後から空白が 1 つ消えていた
+        same = {"type": "result", "is_error": False, "num_turns": 1}
+        for body in (("Qantrel " * 500).rstrip(), "合成の文です" + " Qantrel" * 400,
+                     ("合成の文です。 " * 400).rstrip(), ("合成の文です、　" * 400).rstrip()):
+            with self.subTest(body=body[:10]):
+                self.body = body
+                stub, out, err = self._run(lambda b, i: {**same, "result": b})
+                self.assertIsNone(err)
+                self.assertGreater(len(stub.bodies), 1)
+                self.assertEqual(out, body)  # 校閲が何も変えなければ、つないだ文は元と 1 字も違わない
+                self.assertTrue(all(b == b.strip() for b in stub.bodies))
 
     def test_short_body_is_one_call_with_the_040_message_and_no_retry(self):
         self.body = _memo(5, seed=6)

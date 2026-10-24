@@ -341,15 +341,21 @@ KIND_SOFT = 4  # 「、」・空白
 KIND_HARD = 5  # どれも無い（目安の位置で切る）
 
 _PARAGRAPH_SEP_RE = re.compile(r"\n\s*\n")
-_SENTENCE_END_RE = re.compile(f"[{re.escape(SENTENCE_END_CHARS)}]+[{re.escape(CLOSING_CHARS)}]*")
-_SOFT_BREAK_RE = re.compile(r"[、，,]|\s")
+# 段落の中の境目。後ろの空白は区切り (Chunk.sep) にして、つなぐときに戻す (空白を失わない)
+_SENTENCE_END_RE = re.compile(f"[{re.escape(SENTENCE_END_CHARS)}]+[{re.escape(CLOSING_CHARS)}]*(?P<ws>\\s*)")
+_COMMA_RE = re.compile(r"[、，,](?P<ws>\s*)")
+_SPACE_RE = re.compile(r"(?P<ws>\s+)")
+
+# 境目を選ぶ順: 文の終わり (種類 1・2) が切ってよい範囲のどこかにあれば、まとまりの数を守るより先にそれを使う
+_SENTENCE_KINDS = (KIND_PARAGRAPH_AFTER_SENTENCE, KIND_SENTENCE)
+_OTHER_KINDS = (KIND_PARAGRAPH, KIND_SOFT)
 
 
 class Chunk(NamedTuple):
     """分けた本文の 1 まとまり。sep + text を順につなぐと、元の本文と 1 字も違わない。"""
 
     text: str
-    sep: str  # 前のまとまりとの間にあった文字列（段落の境目なら空行。段落の中なら ""）
+    sep: str  # 前のまとまりとの間にあった文字列（段落の境目なら空行。段落の中なら境目の空白で、無ければ ""）
     kind: int  # 前の境目の種類（KIND_*。最初のまとまりは 0）
 
 
@@ -362,10 +368,12 @@ def _cut_points(text: str) -> list[tuple[int, int, int]]:
     for sep_start, sep_end in spans:
         para = text[para_start:sep_start]
         last = len(para.rstrip())
-        for regex, kind in ((_SENTENCE_END_RE, KIND_SENTENCE), (_SOFT_BREAK_RE, KIND_SOFT)):
+        for regex, kind in ((_SENTENCE_END_RE, KIND_SENTENCE), (_COMMA_RE, KIND_SOFT), (_SPACE_RE, KIND_SOFT)):
             for m in regex.finditer(para):
-                if m.end() < last:  # 段落の終わり (の空白) では切らない。そこは段落の境目
-                    points.append((para_start + m.end(), kind, 0))
+                cut = m.start("ws")
+                # 段落の頭と、段落の終わり (の空白) では切らない。段落の終わりは段落の境目
+                if 0 < cut and m.end() < last:
+                    points.append((para_start + cut, kind, m.end() - cut))
         if sep_start < len(text):
             kind = KIND_PARAGRAPH_AFTER_SENTENCE if ends_with_sentence_end(para) else KIND_PARAGRAPH
             points.append((sep_start, kind, sep_end - sep_start))
@@ -374,14 +382,16 @@ def _cut_points(text: str) -> list[tuple[int, int, int]]:
     return points
 
 
-def _pick(points: list[tuple[int, int, int]], lo: float, hi: float, ideal: float):
-    """lo〜hi の中で、種類のいちばん良い位置 (同じ種類なら ideal に近い位置) を返す。無ければ None。"""
+def _pick(points: list[tuple[int, int, int]], lo: float, hi: float, ideal: float, kinds: tuple[int, ...]):
+    """lo〜hi の中の kinds の位置のうち、種類のいちばん良い位置 (同じ種類なら ideal に近い位置) を返す。無ければ None。"""
     best = None
     for p in points:
         if p[0] < lo:
             continue
         if p[0] > hi:
             break
+        if p[1] not in kinds:
+            continue
         key = (p[1], abs(p[0] - ideal))
         if best is None or key < best[0]:
             best = (key, p)
@@ -391,11 +401,14 @@ def _pick(points: list[tuple[int, int, int]], lo: float, hi: float, ideal: float
 def split_into_chunks(text: str, max_chars: int = CHUNK_CHARS) -> list[Chunk]:
     """本文を max_chars 以下のまとまりに分ける。max_chars 以下なら分けない (1 つ)。
 
-    まとまりの数は ⌈字数 / max_chars⌉ で、大きさをそろえる (目安の位置 = 残りの字数 / 残りのまとまりの数)。
-    境目は、目安の ±max_chars/4 (まとまりが max_chars を超えない範囲) の中で、種類の良い順 (KIND_*)、
-    同じ種類なら目安に近い所。まとまりの数が増えない位置 (残りが、残りのまとまりの数に収まる位置) を先に探し、
-    無ければ数が増えるのを許す。その範囲に無ければ max_chars/4〜max_chars の範囲で同じ順。どの候補も、残りが
-    max_chars/4 より短くなる所は除く (小さいまとまりを作らない)。どれも無ければ目安の位置で切る。
+    まとまりの数は ⌈字数 / max_chars⌉ を目安に、大きさをそろえる (目安の位置 = 残りの字数 / 残りのまとまりの数)。
+    どのまとまりも max_chars/4 以上にする (前から max_chars/4 より前と、残りが max_chars/4 より短くなる所では切らない)。
+    境目は、次の順に探す。
+      1. 文の終わり (種類 1・2) を、(a) 目安の ±max_chars/4 のうちまとまりの数が増えない所、(b) 切ってよい範囲の
+         うち数が増えない所、(c) 目安の ±max_chars/4 (数が増えてもよい)、(d) 切ってよい範囲、の順に。
+      2. 文の終わりがどこにも無ければ、段落の境目・「、」・空白 (種類 3・4) を、同じ (a)〜(d) の順に。
+      3. それも無ければ、目安の位置で切る (種類 5)。
+    同じ範囲の中では種類の良い所、同じ種類なら目安に近い所。文の途中で切らないことを、まとまりの数より先にする。
     """
     if max_chars < 1:
         raise ValueError("max_chars は 1 以上")
@@ -413,10 +426,9 @@ def split_into_chunks(text: str, max_chars: int = CHUNK_CHARS) -> list[Chunk]:
         # 短くなる所では切らない
         floor, ceil_ = start + max_chars / 4, min(limit, len(text) - max_chars / 4)
         lo, hi = max(floor, ideal - max_chars / 4), min(ideal + max_chars / 4, ceil_)
-        best = (_pick(points, max(lo, need), hi, ideal)
-                or _pick(points, max(floor, need), ceil_, ideal)
-                or _pick(points, lo, hi, ideal)
-                or _pick(points, floor, ceil_, ideal))
+        ranges = ((max(lo, need), hi), (max(floor, need), ceil_), (lo, hi), (floor, ceil_))
+        best = next((b for kinds in (_SENTENCE_KINDS, _OTHER_KINDS) for a, z in ranges
+                     if (b := _pick(points, a, z, ideal, kinds))), None)
         pos, kind, sep_len = best if best else (min(limit, max(start + 1, need, int(ideal))), KIND_HARD, 0)
         chunks.append(Chunk(text[start:pos], sep, kind_before))
         sep, kind_before, start = text[pos:pos + sep_len], kind, pos + sep_len
@@ -425,10 +437,10 @@ def split_into_chunks(text: str, max_chars: int = CHUNK_CHARS) -> list[Chunk]:
 
 
 def _join(chunks: list[Chunk], outputs: list[str]) -> str:
-    """校閲後のまとまりを、元の区切りでつなぐ (段落の境目は空行、段落の中は区切りなし)。"""
+    """校閲後のまとまりを、元の区切りでつなぐ (段落の境目は空行、段落の中は境目にあった空白か、区切りなし)。"""
     out = outputs[0]
     for c, o in zip(chunks[1:], outputs[1:]):
-        out += ("\n\n" if c.kind in (KIND_PARAGRAPH_AFTER_SENTENCE, KIND_PARAGRAPH) else "") + o
+        out += ("\n\n" if c.kind in (KIND_PARAGRAPH_AFTER_SENTENCE, KIND_PARAGRAPH) else c.sep) + o
     return out
 
 
