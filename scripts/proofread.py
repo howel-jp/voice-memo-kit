@@ -437,10 +437,14 @@ def split_into_chunks(text: str, max_chars: int = CHUNK_CHARS) -> list[Chunk]:
 
 
 def _join(chunks: list[Chunk], outputs: list[str]) -> str:
-    """校閲後のまとまりを、元の区切りでつなぐ (段落の境目は空行、段落の中は境目にあった空白か、区切りなし)。"""
+    """校閲後のまとまりを、元の区切りでつなぐ (段落の境目は空行、段落の中は境目にあった空白か、区切りなし)。
+
+    段落の中の区切りも LF にそろえる (校閲後のまとまりは _strip_wrapping で LF にそろえてあるので、つないだ文に
+    CR を残さない。段落の中の「。\\r\\n」が境目のとき。#12、PR #10 のレビュー 3 回目の任意 1)。
+    """
     out = outputs[0]
     for c, o in zip(chunks[1:], outputs[1:]):
-        out += ("\n\n" if c.kind in (KIND_PARAGRAPH_AFTER_SENTENCE, KIND_PARAGRAPH) else c.sep) + o
+        out += ("\n\n" if c.kind in (KIND_PARAGRAPH_AFTER_SENTENCE, KIND_PARAGRAPH) else _normalize_newlines(c.sep)) + o
     return out
 
 

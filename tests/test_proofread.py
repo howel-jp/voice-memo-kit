@@ -613,6 +613,19 @@ class ChunkedProofreadTest(_Patched):
                 self.assertEqual(out, body)  # 校閲が何も変えなければ、つないだ文は元と 1 字も違わない
                 self.assertTrue(all(b == b.strip() for b in stub.bodies))
 
+    def test_cr_in_a_boundary_inside_a_paragraph_is_not_joined_back(self):
+        # #12 (PR #10 のレビュー 3 回目の任意 1): 段落の中の「。\r\n」が境目のとき、区切りの CR をつないだ文に戻さない。
+        # format_body の道 (段落の中に CR が入らない) では起きない形。校閲後のまとまりと同じく LF にそろえる
+        self.body = "あ" * 1500 + "。\r\n" + "い" * 1500 + "。" + "う" * 1400
+        chunks = p.split_into_chunks(self.body)
+        self.assertEqual([(c.kind, c.sep) for c in chunks[1:]], [(p.KIND_SENTENCE, "\r\n")])
+        same = {"type": "result", "is_error": False, "num_turns": 1}
+        stub, out, err = self._run(lambda b, i: {**same, "result": b})
+        self.assertIsNone(err)
+        self.assertEqual(len(stub.bodies), 2)
+        self.assertNotIn("\r", out)
+        self.assertEqual(out, self.body.replace("\r\n", "\n"))
+
     def test_short_body_is_one_call_with_the_040_message_and_no_retry(self):
         self.body = _memo(5, seed=6)
         self.assertLessEqual(len(self.body), p.CHUNK_CHARS)
