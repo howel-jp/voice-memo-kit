@@ -79,6 +79,31 @@ def _ends_cleanly(text: str) -> bool:
     return text.rstrip()[-1:] in ("。", "？", "！", "?", "!", "」", "）")
 
 
+def coverage(body: str, out: str) -> dict:
+    """校閲後の段落が、入力のどの段落に当たるか (最も似た段落の番号) から、欠けた範囲を見る。
+
+    比の安全ガード (60%) を通っても、入力の前の方や途中が丸ごと無いことがある (2026-10-24 に観測)。
+    """
+    if not out:
+        return {}
+
+    def grams(t: str) -> set[str]:
+        return {t[i:i + 2] for i in range(len(t) - 1)}
+
+    def sim(a: set[str], b: set[str]) -> float:
+        return len(a & b) / max(1, len(a | b))  # 2 字の組の Jaccard
+
+    inp = [grams(p) for p in body.split("\n\n")]
+    outp = [grams(p) for p in out.split("\n\n")]
+    matched = [max(range(len(inp)), key=lambda i: sim(inp[i], o)) for o in outp]
+    covered = set(matched)
+    return {
+        "first_output_matches_input_para": matched[0],
+        "last_output_matches_input_para": matched[-1],
+        "input_paras_not_matched": len(inp) - len(covered),
+    }
+
+
 def measure_one(body: str, canonicals: list[str], model: str, timeout: float, real_run=None) -> tuple[dict, str]:
     """1 回の校閲を測る。戻り値は (数だけの記録, 校閲後の本文 (合成の文) か "")。"""
     import proofread
@@ -113,6 +138,7 @@ def measure_one(body: str, canonicals: list[str], model: str, timeout: float, re
         "wall_sec_cli": record.get("wall_sec"),
         "wall_sec_total": total,
         "flags": record.get("flags"),
+        **coverage(body, out),
         **meta,
     }
     return row, out

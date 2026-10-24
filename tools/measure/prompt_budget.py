@@ -10,6 +10,9 @@ whisperx 3.8.5 の batched の経路は、prompt の長さによらず ctranslat
     # (b) 影響: キットの engine.transcribe_audio で、prompt の長さを変えて比べる
     python tools/measure/prompt_budget.py effect --audio <dir>/dense.wav --source-text <dir>/dense.txt --items 0,10,20,78
 
+effect は prompt を替えるたびにモデルを読み直す。1 プロセスで続けると、2026-10-24 に 172 秒の音声で
+10 分を超えても終わらなかったことがある (原因は未確認)。確実に測るときは --items を 1 つずつ別のプロセスで渡す。
+
 音声は合成の音声だけを使う (make_tts.ps1)。どちらも HF_HUB_OFFLINE=1 と PYANNOTE_METRICS_ENABLED=false を
 このプロセスに設定してから import する (ダウンロードと telemetry をしない)。モデルがキャッシュに無ければ失敗する。
 import しただけでは、重い import をしない。

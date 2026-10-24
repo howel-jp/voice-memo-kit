@@ -259,6 +259,15 @@ class ProofreadTimingTest(unittest.TestCase):
         self.assertEqual(row["input_paragraphs"], 2)
         self.assertIn("--print", row["flags"])
         self.assertNotIn("result", row)  # 本文は記録に入れない
+        self.assertEqual((row["first_output_matches_input_para"], row["input_paras_not_matched"]), (0, 0))
+
+    def test_coverage_detects_missing_front(self):
+        paras = [synth.synth_memo_text(200, s).split("\n\n")[0] for s in range(6)]
+        body = "\n\n".join(paras)
+        cov = pt.coverage(body, "\n\n".join(paras[3:]))
+        self.assertEqual(cov["first_output_matches_input_para"], 3)
+        self.assertEqual(cov["last_output_matches_input_para"], 5)
+        self.assertEqual(cov["input_paras_not_matched"], 3)
 
     def test_empty_result_is_flagged(self):
         row, out = pt.measure_one(self.BODY, [], "m", 10.0, real_run=self._fake_run("", []))
