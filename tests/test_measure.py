@@ -296,6 +296,26 @@ class TimeoutWaitTest(unittest.TestCase):
         self.assertIn("dry-run", buf.getvalue())
 
 
+class PromptBudgetPureTest(unittest.TestCase):
+    def test_predicted_cap_formula(self):
+        import prompt_budget as pb
+
+        self.assertEqual(pb.predicted_cap(448, 228), 221)  # 前文 223 + 印 5
+        self.assertEqual(pb.predicted_cap(448, 4), 224)    # 前文なし: M // 2 が先に効く
+        self.assertEqual(pb.predicted_cap(20, 4), 10)
+
+    def test_prompt_sources(self):
+        import prompt_budget as pb
+
+        full = pb._prompt_sources(char_encoder, "full", [0, 10])
+        self.assertEqual([(lbl, p) for lbl, _t, p in full], [("items=0", -1), ("items=10", -1)])
+        self.assertEqual(full[0][1], "")
+        self.assertTrue(full[1][1].startswith(ptok.PREFIX))
+        tail = pb._prompt_sources(char_encoder, "tail", [0, 50])
+        self.assertEqual([p for _l, _t, p in tail], [0, 50])
+        self.assertGreaterEqual(len(char_encoder(" " + tail[0][1])[0]), ptok.KEEP + 10)
+
+
 class ImportSideEffectTest(unittest.TestCase):
     def test_import_is_light(self):
         code = (

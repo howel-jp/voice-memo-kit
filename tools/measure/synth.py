@@ -266,7 +266,9 @@ def main(argv: list[str] | None = None) -> int:
     else:
         text = synth_tts_text(args.chars, args.seed)
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(text, encoding="utf-8")
+    # Windows でも LF で書く (字数の数え方を、作った文と揃えるため)
+    with open(args.out, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
     print(f"wrote {args.out} ({len(text)} chars)")
     return 0
 

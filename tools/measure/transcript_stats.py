@@ -152,6 +152,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--minutes", type=float, default=45.0, help="字数を見込む長さ (分)")
     ap.add_argument("--json", type=Path, default=None)
     args = ap.parse_args(argv)
+    _kit.utf8_stdout()
 
     encode = None
     if args.tokens:

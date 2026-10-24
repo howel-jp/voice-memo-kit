@@ -269,6 +269,7 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--global-dir", type=Path, default=None)
     r.add_argument("--projects-glob", default=None, help='例: "C:/Projects/*"')
     args = ap.parse_args(argv)
+    _kit.utf8_stdout()
 
     tok_path = args.tokenizer or _kit.find_tokenizer_json()
     hf_tok = _kit.load_hf_tokenizer(tok_path)

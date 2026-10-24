@@ -26,6 +26,15 @@ def use_kit_scripts() -> None:
         sys.path.insert(0, p)
 
 
+def utf8_stdout() -> None:
+    """標準出力を UTF-8 にする (python -I では PYTHONIOENCODING が効かないため。各道具の main で呼ぶ)。"""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 def force_offline_env() -> None:
     """WhisperX・faster-whisper・pyannote を import する前に呼ぶ。"""
     for k, v in OFFLINE_ENV.items():

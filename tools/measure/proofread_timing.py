@@ -135,6 +135,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out-dir", type=Path, required=True, help="JSONL と合成の入出力の置き場 (repo の外)")
     ap.add_argument("--label", default="run")
     args = ap.parse_args(argv)
+    _kit.utf8_stdout()
 
     sizes = [int(s) for s in args.sizes.split(",") if s]
     model = args.model or default_model()

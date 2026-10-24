@@ -272,6 +272,7 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("--model", default="claude-sonnet-4-6")
     c.add_argument("--grace", type=float, default=120.0)
     args = ap.parse_args(argv)
+    _kit.utf8_stdout()
 
     rows = []
     if args.cmd == "stand-in":
