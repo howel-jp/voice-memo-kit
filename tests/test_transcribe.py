@@ -219,8 +219,8 @@ def _segs(texts: list[str]) -> list[dict]:
     return [{"start": i * 5.0, "end": i * 5.0 + 2.0, "text": tx} for i, tx in enumerate(texts)]
 
 
-class ProcessOneTest(unittest.TestCase):
-    """C5 (#8): 置き換え前の文を残す、校閲されていない本文を校閲済みにしない、失敗の理由を残す。"""
+class _ProcessOneBase(unittest.TestCase):
+    """process_one を whisperx と subprocess.run (Claude CLI) のスタブで走らせる土台。"""
 
     # 合成の語と文。wrong_variants の「ぞるま」が whisperx のスタブの出力に 2 回出る
     ENTRIES = [{"canonical": "ゾルマ", "wrong_variants": ["ぞるま"], "source": "synthetic"}]
@@ -250,7 +250,10 @@ class ProcessOneTest(unittest.TestCase):
         self.addCleanup(patch.stop)
 
     def _cli(self, reply="", *, num_turns=1, is_error=False, returncode=0, timeout=False):
-        """subprocess.run のスタブ (Claude CLI)。reply は、校閲に渡った本文から result を作る関数か文字列。"""
+        """subprocess.run のスタブ (Claude CLI)。reply は、校閲に渡った本文から result を作る関数か文字列。
+
+        num_turns は数か、校閲に渡った本文から数を作る関数 (分けた校閲で、まとまりごとに変えるため)。
+        """
 
         def fake(cmd, *a, **k):
             body = k["stdin"].read().split("【文字起こし本文】\n", 1)[1]
@@ -260,10 +263,13 @@ class ProcessOneTest(unittest.TestCase):
             data = {"type": "result", "is_error": is_error, "result": reply(body) if callable(reply) else reply}
             if is_error:
                 data["subtype"] = "error_during_execution"
-            if num_turns is not None:
-                data["num_turns"] = num_turns
+            turns = num_turns(body) if callable(num_turns) else num_turns
+            if turns is not None:
+                data["num_turns"] = turns
             k["stdout"].write(json.dumps(data, ensure_ascii=False))
-            return subprocess.CompletedProcess(cmd, returncode, None, "合成の stderr の文" if returncode else "")
+            if returncode:
+                k["stderr"].write("合成の stderr の文")  # stderr は一時ファイル (#4 の U5)
+            return subprocess.CompletedProcess(cmd, returncode, None, None)
 
         patch = mock.patch.object(proofread.subprocess, "run", fake)
         patch.start()
@@ -298,6 +304,11 @@ class ProcessOneTest(unittest.TestCase):
             "details": dict(re.findall(r"<details>\n<summary>([^<]*)</summary>\n\n(.*?)\n\n</details>", rest, re.DOTALL)),
             "md": md,
         }
+
+
+
+class ProcessOneTest(_ProcessOneBase):
+    """C5 (#8): 置き換え前の文を残す、校閲されていない本文を校閲済みにしない、失敗の理由を残す。"""
 
     # --- C5-a: 置き換え前の文が 3 通りとも残る -------------------------------------------
 
@@ -420,6 +431,62 @@ class ProcessOneTest(unittest.TestCase):
         self.assertNotIn("proofread_error", r["fm"])
         self.assertEqual(r["body"], self.REPLACED.replace("えーと、", ""))
         self.assertNotIn(b"\r\r", r["raw"])
+
+
+class ProcessOneChunkedTest(_ProcessOneBase):
+    """#2: 3,000 字を超える文字起こしは分けて校閲する。1 つでも通らなければ、本文全体を校閲前にする (C5)。"""
+
+    # 合成の 100 段落 (どれも文の終わりで終わる)。どの段落にも置き換え前の語「ぞるま」が 1 回出る
+    TEXTS = [f"えーと、合成の段落{i:02d}でぞるまの話をします。続けて段取りを確かめます。"
+             f"それから資料の置き場所も決めておきたいです。最後に次の予定を話します。" for i in range(100)]
+
+    def setUp(self):
+        super().setUp()
+        self.segs = _segs(self.TEXTS)
+        self.raw = "\n\n".join(self.TEXTS)
+        self.replaced = self.raw.replace("ぞるま", "ゾルマ")
+        self.chunks = proofread.split_into_chunks(self.replaced)
+        self.assertEqual(len(self.chunks), 3)
+
+    def _run_long(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return self._run(segs=self.segs)
+
+    def test_all_chunks_pass(self):
+        self._cli(lambda b: b.replace("えーと、", ""))
+        r = self._run_long()
+        self.assertEqual(self.cli_bodies, [c.text for c in self.chunks])
+        self.assertTrue(all(len(b) <= proofread.CHUNK_CHARS for b in self.cli_bodies))
+        self.assertEqual(r["keys"], self.KEYS)  # 今の 7 キーが同じ順。足すキーは付かない
+        self.assertEqual((r["fm"]["proofread"], r["fm"]["glossary_replacements"]), (self.model, "100"))
+        self.assertEqual(r["body"], self.replaced.replace("えーと、", ""))  # つないだ校閲後
+        self.assertEqual(proofread.count_paragraphs(r["body"]), 100)  # 入力の段落が欠けずに残る
+        self.assertEqual(r["summaries"], [t.PRE_PROOFREAD_SUMMARY, t.PRE_REPLACEMENT_SUMMARY])
+        self.assertEqual(r["details"][t.PRE_PROOFREAD_SUMMARY], self.replaced)  # 校閲前の節は全体
+        self.assertEqual(r["details"][t.PRE_REPLACEMENT_SUMMARY], self.raw)
+
+    def test_one_chunk_failing_marks_the_whole_memo_unproofread(self):
+        c2 = self.chunks[1].text
+        # まとまり 2 とそのやり直しは num_turns 3 (欠けの疑い)。ほかは通る
+        self._cli(lambda b: b.replace("えーと、", ""), num_turns=lambda b: 3 if b in c2 else 1)
+        r = self._run_long()
+        self.assertEqual(r["keys"], self.ERROR_KEYS)
+        self.assertEqual(r["fm"]["proofread"], "false")  # 校閲されていない部分があるので、校閲済みと読めない
+        self.assertEqual(r["fm"]["proofread_error"], "incomplete")
+        self.assertEqual(json.loads(r["fm"]["proofread_error_detail"]), "まとまり 2/3: num_turns 3")
+        self.assertEqual(r["body"], self.replaced)  # 本文は全体が校閲前 (通ったまとまり 1 の校閲後も使わない)
+        self.assertEqual(r["summaries"], [t.PRE_REPLACEMENT_SUMMARY])
+        self.assertEqual(r["details"][t.PRE_REPLACEMENT_SUMMARY], self.raw)
+        self.assertNotIn(self.chunks[2].text, self.cli_bodies)  # まとまり 3 は呼ばない
+        self.assertEqual(len(self.cli_bodies), 3)  # まとまり 1、2、2 のやり直しの前半
+
+    def test_retry_that_passes_keeps_the_memo_proofread(self):
+        c2 = self.chunks[1].text
+        self._cli(lambda b: b.replace("えーと、", ""), num_turns=lambda b: 3 if b == c2 else 1)
+        r = self._run_long()
+        self.assertEqual(r["fm"]["proofread"], self.model)
+        self.assertEqual(r["body"], self.replaced.replace("えーと、", ""))
+        self.assertEqual(len(self.cli_bodies), 5)  # まとまり 3 つ + まとまり 2 のやり直し 2 つ
 
 
 class HeadingDocsTest(unittest.TestCase):

@@ -317,6 +317,41 @@ class ProofreadTimingTest(unittest.TestCase):
         self.assertNotIn("result", row)  # 本文は記録に入れない
         self.assertEqual((row["first_output_matches_input_para"], row["input_paras_not_matched"]), (0, 0))
 
+    def test_single_call_columns_are_unchanged_and_the_call_is_listed(self):
+        # 呼び出しが 1 回のときの列は今までと同じ値 (#4 の数を読み直せるように)。足すのは cli_calls と calls だけ
+        calls = []
+        cleaned = self.BODY.replace("えーと、", "")
+        row, _ = pt.measure_one(self.BODY, ["語"], "m", 1800.0, real_run=self._fake_run(cleaned, calls))
+        self.assertEqual((row["num_turns"], row["duration_ms"], row["output_tokens"]), (1, 1234, 20))
+        self.assertEqual(row["cli_calls"], 1)
+        self.assertEqual(row["calls"][0]["input_chars"], len(self.BODY))
+        self.assertEqual((row["calls"][0]["duration_ms"], row["calls"][0]["wall_sec"]), (1234, row["wall_sec_cli"]))
+
+    def test_chunked_proofread_records_each_call(self):
+        # 3,000 字を超える本文はキットが分けて校閲する (#2)。まとまりごとの字数・時間・トークンを並べる
+        body = synth.synth_memo_text(7000, 1)
+        chunks = proofread.split_into_chunks(body)
+        self.assertGreater(len(chunks), 1)
+
+        def fake(cmd, *a, **k):
+            msg = Path(k["stdin"].name).read_text(encoding="utf-8")
+            k["stdout"].write(json.dumps({
+                "type": "result", "is_error": False, "duration_ms": 1000, "num_turns": 1,
+                "result": msg.split("【文字起こし本文】\n", 1)[1], "usage": {"output_tokens": 10},
+            }, ensure_ascii=False))
+            return subprocess.CompletedProcess(cmd, 0, None, None)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            row, out = pt.measure_one(body, ["語"], "m", 900.0, real_run=fake)
+        n = len(chunks)
+        self.assertEqual((row["status"], out), ("ok", body))
+        self.assertEqual(row["cli_calls"], n)
+        self.assertEqual([c["input_chars"] for c in row["calls"]], [len(c.text) for c in chunks])
+        self.assertEqual([c["num_turns"] for c in row["calls"]], [1] * n)
+        self.assertEqual((row["duration_ms"], row["output_tokens"], row["num_turns"]), (1000 * n, 10 * n, 1))
+        self.assertEqual(row["input_paras_not_matched"], 0)
+        self.assertNotIn(chunks[0].text[:20], json.dumps(row["calls"], ensure_ascii=False))  # 本文は記録に入れない
+
     def test_coverage_detects_missing_front(self):
         paras = [synth.synth_memo_text(200, s).split("\n\n")[0] for s in range(6)]
         body = "\n\n".join(paras)
