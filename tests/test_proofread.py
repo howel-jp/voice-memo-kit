@@ -392,6 +392,16 @@ class SplitIntoChunksTest(unittest.TestCase):
         for c in chunks[1:]:
             self.assertNotIn(c.text[0], p.CLOSING_CHARS)  # 「。」と「」」の間で切らない
 
+    def test_cut_after_closing_bracket_when_every_sentence_is_quoted(self):
+        body = "「それでいいです。」" * 700  # どの文も「。」」で終わる 1 段落
+        chunks = p.split_into_chunks(body)
+        self._check_lossless(body, chunks)
+        self.assertGreater(len(chunks), 1)
+        for c in chunks[1:]:
+            self.assertTrue(c.text.startswith("「"), c.text[:3])  # 「。」と「」」の間で切らない
+        for c in chunks[:-1]:
+            self.assertTrue(c.text.endswith("。」"), c.text[-3:])
+
     def test_sentence_end_is_preferred_over_paragraph_boundary_without_it(self):
         # 段落の末尾に句点が無い (文の途中の無音で分かれた形) ときは、段落の中の文の終わりで切る
         body = "\n\n".join(pa + "えーと" for pa in _memo(60, seed=3).split("\n\n"))
