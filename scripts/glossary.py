@@ -9,14 +9,31 @@ JSON の書式:
 {
   "title": "<カテゴリ名>",
   "entries": [
-    {"canonical": "<正式表記>", "wrong_variants": ["<誤認識パターン>", ...], "notes": "..."}
+    {"canonical": "<正式表記>", "wrong_variants": ["<誤認識パターン>", ...], "notes": "...",
+     "priority": true}
   ]
 }
+priority（省略可）: true の語は、initial_prompt が Whisper の上限に収まらないとき優先して届ける（#1。plan_initial_prompt）。
 """
 from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Callable, NamedTuple
+
+# initial_prompt の形（build_initial_prompt の戻り値は 0.3.x から変えない）
+PROMPT_PREFIX = "以下は本音声で言及される固有名詞の一覧です: "
+PROMPT_SEPARATOR = "、"
+PROMPT_END = "。"
+
+# faster-whisper 1.2.1（whisperx 3.8.5 が使う）の WhisperModel.max_length。
+# initial_prompt は " " + prompt.strip() でトークン化され（whisperx/asr.py）、get_prompt が後ろの
+# max_length // 2 - 1 = 223 トークンだけを使う（faster_whisper/transcribe.py。#3 §2 の行 1）。
+WHISPER_MAX_LENGTH = 448
+PROMPT_MAX_TOKENS = WHISPER_MAX_LENGTH // 2 - 1
+
+# encode(text) -> (トークンの id の list, 各トークンの文字の範囲 (start, end) の list)。特殊トークンは足さない。
+Encoder = Callable[[str], "tuple[list[int], list[tuple[int, int]]]"]
 
 
 def load_glossary(glossary_dir: Path | None) -> list[dict]:
@@ -72,7 +89,121 @@ def build_initial_prompt(entries: list[dict]) -> str:
     canonicals = [e["canonical"] for e in entries if e.get("canonical")]
     if not canonicals:
         return ""
-    return "以下は本音声で言及される固有名詞の一覧です: " + "、".join(canonicals) + "。"
+    return PROMPT_PREFIX + PROMPT_SEPARATOR.join(canonicals) + PROMPT_END
+
+
+# --- initial_prompt の長さと、届ける語の優先 (#1) ------------------------------
+
+def is_priority(entry: dict) -> bool:
+    """辞書の項目に、initial_prompt で優先する印（"priority": true）があるか。JSON の true のときだけ。"""
+    return entry.get("priority") is True
+
+
+class PromptPlan(NamedTuple):
+    """Whisper に渡す initial_prompt と、何が届くかの数（plan_initial_prompt の戻り値）。"""
+
+    text: str  # Whisper に渡す initial_prompt
+    tokens: int | None  # whisperx がトークン化する " " + text.strip() のトークン数（数えられないとき None）
+    words: int  # 辞書の語（canonical のある項目）の数
+    reached: list[str] | None  # Whisper に届く語（辞書の順）。数えられないとき None
+    missed: list[str] | None  # 届かない語（辞書の順）。数えられないとき None
+    prefix_reached: bool | None  # 前置きの文が欠けずに届くか
+    marked: int  # 印の語の数
+    marked_reached: int | None  # 届く印の語の数
+    selected: bool  # キットが語を選んだ（印の語があって、全部は収まらないとき）
+
+
+def _whisper_text(text: str) -> str:
+    """whisperx が tokenizer.encode に渡す文字列（whisperx/asr.py の " " + initial_prompt.strip()）。"""
+    return " " + text.strip() if text else ""
+
+
+def _assemble(canonicals: list[str]) -> tuple[str, list[tuple[int, int]]]:
+    """build_initial_prompt と同じ形の文字列と、_whisper_text の中での各語の文字の範囲 [start, end)。"""
+    if not canonicals:
+        return "", []
+    text = PROMPT_PREFIX + PROMPT_SEPARATOR.join(canonicals) + PROMPT_END
+    pos = 1 + len(PROMPT_PREFIX)  # 先頭の " " の分
+    spans = []
+    for c in canonicals:
+        spans.append((pos, pos + len(c)))
+        pos += len(c) + len(PROMPT_SEPARATOR)
+    return text, spans
+
+
+def _reach(text: str, spans: list[tuple[int, int]], encode: Encoder, max_tokens: int) -> tuple[int, list[bool], bool]:
+    """(トークン数, 語ごとに届くか, 前置きの文が届くか)。
+
+    届く = 後ろ max_tokens トークンに欠けずに入る: 切り捨てた最後のトークンの終わりより後ろから始まる語
+    （1 字が 2 トークンに割れて境目がその字にかかる語は届かない側。tools/measure/prompt_tokens.py の analyze と同じ）。
+    """
+    if not text:
+        return 0, [], False
+    ids, offsets = encode(_whisper_text(text))
+    n = len(ids)
+    dropped = max(0, n - max_tokens)
+    if not dropped:
+        return n, [True] * len(spans), True
+    cut = offsets[dropped - 1][1]
+    return n, [s >= cut for s, _ in spans], False
+
+
+def count_prompt_tokens(text: str, encode: Encoder) -> int:
+    """whisperx が initial_prompt をトークン化したときの数（" " + text.strip()。空なら 0）。"""
+    return len(encode(_whisper_text(text))[0]) if text else 0
+
+
+def plan_initial_prompt(
+    entries: list[dict], encode: Encoder | None = None, *, max_tokens: int = PROMPT_MAX_TOKENS
+) -> PromptPlan:
+    """Whisper に渡す initial_prompt を決め、どの語が届くかを数える（#1）。
+
+    規則:
+      1. 前置きの文と全部の語が max_tokens に収まる → build_initial_prompt と同じ文字列。
+      2. 収まらず、印（"priority": true）の語が無い → build_initial_prompt と同じ文字列（0.5.0 と同じ。
+         Whisper が後ろ max_tokens だけを使う）。届く語を数えるだけ。
+      3. 収まらず、印の語がある → 前置きの文を入れ、優先の高い順に 1 語ずつ、合わせて max_tokens に入るなら入れる
+         （入らない語は飛ばして次へ）。優先の順は 印の語 → 印の無い語、同じ印のうちでは辞書の後ろの方が先。
+         並べるのは優先の低い順（印の無い語、印の語。それぞれの中は辞書の順）で、優先の高い語が後ろに来る。
+    encode が None（トークン数を数えられない）なら、全部の語を優先の低い順に並べる（印が無ければ
+    build_initial_prompt と同じ文字列）。届く語は分からない（None）。
+    """
+    items = [e for e in entries if e.get("canonical")]
+    canon = [e["canonical"] for e in items]
+    marks = [is_priority(e) for e in items]
+    n_marked = sum(marks)
+    order = [i for i, m in enumerate(marks) if not m] + [i for i, m in enumerate(marks) if m]
+
+    if encode is None:
+        text, _ = _assemble([canon[i] for i in order])
+        return PromptPlan(text, None, len(items), None, None, None, n_marked, None, False)
+
+    text, spans = _assemble(canon)  # = build_initial_prompt(entries)
+    tokens, flags, prefix_ok = _reach(text, spans, encode, max_tokens)
+    selected = False
+    if tokens > max_tokens and n_marked:
+        chosen: set[int] = set()
+        for i in reversed(order):  # 優先の高い順
+            trial, _ = _assemble([canon[j] for j in order if j in chosen or j == i])
+            if count_prompt_tokens(trial, encode) <= max_tokens:
+                chosen.add(i)
+        picked = [j for j in order if j in chosen]
+        text, sub_spans = _assemble([canon[j] for j in picked])
+        tokens, sub_flags, prefix_ok = _reach(text, sub_spans, encode, max_tokens)
+        reached_idx = {j for j, ok in zip(picked, sub_flags) if ok}
+        flags = [i in reached_idx for i in range(len(items))]
+        selected = True
+    return PromptPlan(
+        text=text,
+        tokens=tokens,
+        words=len(items),
+        reached=[c for c, ok in zip(canon, flags) if ok],
+        missed=[c for c, ok in zip(canon, flags) if not ok],
+        prefix_reached=prefix_ok,
+        marked=n_marked,
+        marked_reached=sum(1 for m, ok in zip(marks, flags) if m and ok),
+        selected=selected,
+    )
 
 
 def _collides_with_canonical(wrong: str, next_char: str, canonicals: set[str]) -> bool:

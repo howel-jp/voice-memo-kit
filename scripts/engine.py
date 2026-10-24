@@ -6,15 +6,58 @@
 モデルはプロセス内でキャッシュする（同じ設定なら 1 回だけロード）。
 複数ファイルを続けて処理するとき、ファイルごとの再ロード（実測 14〜17 秒）を避けるため。
 initial_prompt は WhisperX では load_model 時の asr_options で渡す仕様のため、キャッシュキーに含める。
+そのため initial_prompt のトークン数は、モデルを読む前に、モデルと同じ tokenizer.json で数える（load_prompt_encoder。#1）。
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 # whisperx.load_audio は 16kHz モノラル float32 を返す（SAMPLE_RATE 固定）
 WHISPER_SAMPLE_RATE = 16000
 
 _MODEL_CACHE: dict[tuple, object] = {}
+_PROMPT_ENCODERS: dict[str, object] = {}
+
+
+def load_prompt_encoder(model_name: str = "large-v3"):
+    """initial_prompt のトークン数を数える encode と、数えられないときの理由を返す（#1）。
+
+    戻り値: (encode, "") か (None, 理由)。encode(text) -> (ids, offsets) は faster-whisper の Tokenizer.encode
+    と同じく特殊トークンを足さない（whisperx が prompt をトークン化するのと同じ）。
+    tokenizer.json は faster-whisper の WhisperModel が読むのと同じもの: model_name がディレクトリならその中、
+    名前なら faster_whisper.utils.download_model(model_name, local_files_only=True) が返す HF キャッシュの
+    snapshot（local_files_only なのでネットにつながない）。import は呼ばれたときだけ行う。
+    読めたものはプロセスの中でキャッシュする（読めなかったときは次の呼び出しでまた探す。初回のダウンロードの後に数えられるように）。
+    """
+    cached = _PROMPT_ENCODERS.get(model_name)
+    if cached is not None:
+        return cached, ""
+    try:
+        if os.path.isdir(model_name):
+            model_path = model_name
+        else:
+            from faster_whisper.utils import download_model
+
+            model_path = download_model(model_name, local_files_only=True)
+        tokenizer_file = os.path.join(str(model_path), "tokenizer.json")
+        if not os.path.isfile(tokenizer_file):
+            return None, "モデルの tokenizer.json が無い"
+        import tokenizers
+
+        hf_tokenizer = tokenizers.Tokenizer.from_file(tokenizer_file)
+    except Exception as e:  # noqa: BLE001 (数えられないだけで、文字起こしは止めない)
+        name = type(e).__name__
+        if "LocalEntryNotFound" in name or isinstance(e, FileNotFoundError):
+            return None, "モデルがまだ HF のキャッシュに無い（初回のダウンロードの前など）"
+        return None, name
+
+    def encode(text: str):
+        enc = hf_tokenizer.encode(text, add_special_tokens=False)
+        return list(enc.ids), [tuple(o) for o in enc.offsets]
+
+    _PROMPT_ENCODERS[model_name] = encode
+    return encode, ""
 
 
 def get_model(

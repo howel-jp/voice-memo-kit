@@ -94,6 +94,21 @@ class SynthTest(unittest.TestCase):
         self.assertGreaterEqual(len(t), 400)
         self.assertNotIn("\n", t)
 
+    def test_priority_every_marks_and_is_kept_in_json(self):
+        # #1: 4 項目おきに印を付けた 78 項目は印 20 個。辞書 JSON に残り、キットが印と読む
+        marked = synth.mark_priority(synth.mixed_entries(78, 0), 4)
+        self.assertEqual([i for i, e in enumerate(marked) if e.get("priority") is True], list(range(0, 78, 4)))
+        self.assertEqual(synth.mark_priority(synth.mixed_entries(10, 0), 0), synth.mixed_entries(10, 0))
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "g" / "marked.json"
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = synth.main(["dict", "--profile", "mixed", "--count", "78", "--priority-every", "4",
+                                 "--out", str(out)])
+            self.assertEqual(rc, 0)
+            loaded = glossary.load_glossary(out.parent)
+        self.assertEqual(sum(glossary.is_priority(e) for e in loaded), 20)
+        self.assertEqual([e["canonical"] for e in loaded], [e["canonical"] for e in marked])
+
 
 class PromptTokensAnalyzeTest(unittest.TestCase):
     WORDS = ["アルファ", "ベータ線", "ガンマ"]
@@ -135,6 +150,68 @@ class PromptTokensAnalyzeTest(unittest.TestCase):
         over = ptok.analyze(synth.synth_entries("S", n + 1, 0), char_encoder)
         self.assertEqual(fits["dropped"], 0)
         self.assertGreater(over["dropped"], 0)
+
+
+class PromptTokensKitTest(unittest.TestCase):
+    """#1: キットの plan_initial_prompt が渡す文字列の数 (kit_ の列) と、その確かめ (kit_check)。"""
+
+    def test_without_marks_kit_is_the_050_string(self):
+        rows = ptok.synthetic_rows(char_encoder, ["mixed", "S"], [5, 78], 0)
+        for r in rows:
+            with self.subTest(profile=r["profile"], items=r["items"]):
+                self.assertTrue(r["kit_same_as_050"])
+                self.assertFalse(r["kit_selected"])
+                self.assertEqual((r["kit_tokens"], r["kit_reach"], r["kit_miss"]), (r["tokens"], r["reach"], r["miss"]))
+                self.assertTrue(r["kit_check"])
+
+    def test_with_marks_kit_selects_and_all_marked_reach(self):
+        rows = ptok.synthetic_rows(char_encoder, ["mixed"], [5, 78], 0, priority_every=4)
+        small, big = rows
+        self.assertTrue(small["kit_same_as_050"])  # 収まるときは 0.5.0 と同じ文字列
+        self.assertEqual((small["kit_marked"], small["kit_marked_reach"]), (2, 2))
+        self.assertTrue(big["kit_selected"])
+        self.assertFalse(big["kit_same_as_050"])
+        self.assertLessEqual(big["kit_tokens"], ptok.KEEP)
+        self.assertEqual((big["kit_marked"], big["kit_marked_reach"], big["kit_prefix"]), (20, 20, True))
+        self.assertEqual(big["kit_reach"] + big["kit_miss"], 78)
+        self.assertTrue(big["kit_check"])
+        self.assertGreater(big["tokens"], ptok.KEEP)  # 0.5.0 の列は今までどおり全部の語の文字列の数
+
+    def test_kit_check_catches_a_mismatch(self):
+        entries = synth.mixed_entries(78, 0)
+        r = ptok.analyze(entries, char_encoder)
+        wrong = dict(r, reach=r["reach"] + 1)
+        self.assertFalse(ptok.kit_fields(entries, char_encoder, wrong)["kit_check"])
+
+
+class DictRowsPrivacyTest(unittest.TestCase):
+    """#1 の C1: dict は辞書のディレクトリを層の順にマージし、数だけを出す (語・パスを出さない)。"""
+
+    def test_numbers_only_and_layer_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            low = Path(tmp) / "low-zq"
+            high = Path(tmp) / "high-zq"
+            low.mkdir()
+            high.mkdir()
+            (low / "a-zq.json").write_text(json.dumps(
+                {"entries": [{"canonical": "ZQX下の語"}, {"canonical": "ZQX重なる語"}]}, ensure_ascii=False),
+                encoding="utf-8")
+            (high / "b-zq.json").write_text(json.dumps(
+                {"entries": [{"canonical": "ZQX重なる語", "priority": True}]}, ensure_ascii=False), encoding="utf-8")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rows = ptok.dict_rows([low, high], char_encoder)
+                with mock.patch.object(ptok._kit, "load_hf_tokenizer", lambda path=None: object()), \
+                        mock.patch.object(ptok._kit, "hf_encoder", lambda tok: char_encoder):
+                    rc = ptok.main(["--tokenizer", str(Path(tmp) / "zq-tok.json"), "--no-verify", "dict",
+                                    str(low), str(high)])
+        self.assertEqual(rc, 0)
+        (row,) = rows
+        self.assertEqual((row["layer_items"], row["merged_items"], row["kit_marked"]), ([2, 1], 2, 1))
+        self.assertTrue(row["kit_same_as_050"])  # 収まる
+        for out in (buf.getvalue(), json.dumps(rows, ensure_ascii=False)):
+            self.assertNotIn("ZQX", out)
+            self.assertNotIn("zq", out)
 
 
 SECRET_WORDS = ["ZQX秘密語アルファ", "ZQX社外秘ベータ", "ZQX共有の固有名"]

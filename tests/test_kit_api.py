@@ -101,6 +101,13 @@ class CallStyleTest(unittest.TestCase):
         prompt = glossary.build_initial_prompt(merged) if merged else ""
         self.assertIsInstance(prompt, str)
         self.assertIsInstance(glossary.build_initial_prompt([]), str)
+        # #1: 戻り値の中身も 0.5.0 と同じ (2 つのスキルの prompt を変えない)。印 ("priority") があっても並べ替えない
+        self.assertEqual(prompt, "以下は本音声で言及される固有名詞の一覧です: ゾルマ、Qantrel。")
+        marked = [{"canonical": "ゾルマ"}, {"canonical": "Qantrel", "priority": True}, {"canonical": ""},
+                  {"canonical": "ヌビト", "priority": True}]
+        self.assertEqual(glossary.build_initial_prompt(marked),
+                         "以下は本音声で言及される固有名詞の一覧です: ゾルマ、Qantrel、ヌビト。")
+        self.assertEqual(glossary.build_initial_prompt([]), "")
 
         utts = [{"start": 0.0, "end": 1.0, "text": "ぞるまの件", "speaker": "合成"}]
         out = glossary.apply_replacements_to_segments(utts, merged)
@@ -161,7 +168,8 @@ class ImportSideEffectTest(unittest.TestCase):
             "ctypes.cdll = ctypes.windll = BoomLoader()\n"
             f"sys.path.insert(0, {str(ROOT / 'scripts')!r})\n"
             "import transcribe, glossary, engine, proofread\n"
-            "heavy = ['torch', 'whisperx', 'faster_whisper', 'ctranslate2', 'tokenizers', 'numpy', 'pyannote']\n"
+            "heavy = ['torch', 'whisperx', 'faster_whisper', 'ctranslate2', 'tokenizers', 'huggingface_hub', 'numpy',\n"
+            "         'pyannote']\n"
             "print('loaded:' + ','.join(m for m in heavy if m in sys.modules))\n"
         )
         cp = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, encoding="utf-8",

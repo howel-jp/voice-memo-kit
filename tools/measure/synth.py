@@ -4,6 +4,7 @@ public repo なので、測りには利用者の辞書の語・メモの中身�
 音節や字を乱数で組み合わせた架空のもので、同じ種なら同じ結果になる。
 
     python tools/measure/synth.py dict --profile M --count 78 --out <dir>/synthetic.json
+    python tools/measure/synth.py dict --profile mixed --count 78 --priority-every 4 --out <dir>/marked.json  # #1
     python tools/measure/synth.py memo --chars 15000 --out <dir>/memo.txt
     python tools/measure/synth.py tts --chars 400 --out <dir>/tts.txt
 
@@ -233,9 +234,17 @@ def synth_tts_text(target_chars: int, seed: int = 0) -> str:
     return "".join(out)
 
 
+def mark_priority(entries: list[dict], every: int) -> list[dict]:
+    """every 項目おき (先頭から) に、initial_prompt で優先する印 "priority": true を付けた写しを返す (#1)。0 なら付けない。"""
+    if every < 0:
+        raise ValueError("every は 0 以上")
+    return [dict(e, priority=True) if every and i % every == 0 else dict(e) for i, e in enumerate(entries)]
+
+
 def glossary_json(entries: list[dict], title: str = "synthetic") -> str:
     """キットの辞書 JSON の形 (README の「辞書 JSON の書式」) にする。"""
-    clean = [{k: v for k, v in e.items() if k in ("canonical", "wrong_variants", "notes")} for e in entries]
+    keys = ("canonical", "wrong_variants", "notes", "priority")
+    clean = [{k: v for k, v in e.items() if k in keys} for e in entries]
     return json.dumps({"title": title, "entries": clean}, ensure_ascii=False, indent=1)
 
 
@@ -246,6 +255,8 @@ def main(argv: list[str] | None = None) -> int:
     d.add_argument("--profile", choices=list(PROFILES) + ["mixed"], default="mixed")
     d.add_argument("--count", type=int, required=True)
     d.add_argument("--seed", type=int, default=0)
+    d.add_argument("--priority-every", type=int, default=0,
+                   help='N 項目おき (先頭から) に "priority": true を付ける (#1。0 なら付けない)')
     d.add_argument("--out", type=Path, required=True)
     m = sub.add_parser("memo", help="合成のメモの本文")
     m.add_argument("--chars", type=int, required=True)
@@ -260,6 +271,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "dict":
         entries = (mixed_entries(args.count, args.seed) if args.profile == "mixed"
                    else synth_entries(args.profile, args.count, args.seed))
+        entries = mark_priority(entries, args.priority_every)
         text = glossary_json(entries, title=f"synthetic-{args.profile}-{args.count}")
     elif args.cmd == "memo":
         text = synth_memo_text(args.chars, args.seed)

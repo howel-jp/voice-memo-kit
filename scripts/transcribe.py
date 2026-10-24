@@ -38,12 +38,16 @@ try:
 except Exception:
     pass
 
-from engine import transcribe_audio
+from engine import load_prompt_encoder, transcribe_audio
 from glossary import (
+    PROMPT_MAX_TOKENS,
+    WHISPER_MAX_LENGTH,
+    PromptPlan,
     apply_replacements_to_segments,
-    build_initial_prompt,
+    build_initial_prompt,  # noqa: F401（0.5.0 までの名前を transcribe からも引けるように残す）
     load_glossary,
     merge_glossaries,
+    plan_initial_prompt,
 )
 from proofread import describe_failure, proofread_body
 
@@ -58,6 +62,9 @@ PRE_PROOFREAD_SUMMARY = "校閲前（辞書の置き換え後）"
 PRE_REPLACEMENT_SUMMARY = "置き換え前（Whisper の出力）"
 # frontmatter の proofread_error_detail の長さの上限（改行は除く）
 ERROR_DETAIL_MAX_CHARS = 200
+# 1 チャンクの出力（数え直し）がこれを超えたら [WARN]。上限は 224（prompt を使い切ると 221。#4 の U3）。
+# 値は #3 の保留（1 チャンク 224 トークンの頭打ち）の再開の条件と同じ。
+CHUNK_OUTPUT_WARN_TOKENS = 200
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -228,6 +235,73 @@ def load_merged_glossary(paths: dict, use_global: bool) -> list[dict]:
     return merged
 
 
+def prompt_log_lines(plan: PromptPlan, note: str = "") -> list[str]:
+    """initial_prompt の長さと、Whisper に届く語・届かない語のコンソールの行（#1 の C1）。辞書の語が無ければ []。
+
+    note は、トークン数を数えられないときの理由（engine.load_prompt_encoder の 2 つ目の値）。
+    """
+    if not plan.words:
+        return []
+    lim = PROMPT_MAX_TOKENS
+    if plan.tokens is None:
+        return [f"  [WARN] initial_prompt のトークン数を数えられません（{note or '理由は不明'}）。"
+                f"Whisper が使うのは後ろ {lim} トークンまでで、届く語の数は分かりません"]
+    n_reach, n_miss = len(plan.reached or []), len(plan.missed or [])
+    marked = f"（うち印 {plan.marked_reached}/{plan.marked}）" if plan.marked else ""
+    lines: list[str] = []
+    if plan.tokens > lim:  # 印の無い辞書で、0.5.0 と同じ文字列を渡す（Whisper が後ろ 223 だけを使う）
+        lines.append(f"[A] initial_prompt {plan.tokens} トークン（Whisper が使うのは後ろ {lim}）、"
+                     f"届く {n_reach}/{plan.words} 語{marked}、届かない {n_miss} 語")
+        if n_miss:
+            lines.append(f"  [WARN] initial_prompt が {lim} トークンを超えるため、前置きの文と {n_miss} 語は Whisper に"
+                         "届きません（置き換えと校閲には使います）。"
+                         '届けたい語には辞書で "priority": true を付けます（README）')
+        else:
+            lines.append(f"  [WARN] initial_prompt が {lim} トークンを超えるため、前置きの文の前の方は Whisper に届きません"
+                         "（語は全部届きます）")
+    elif plan.selected:
+        lines.append(f"[A] initial_prompt {plan.tokens}/{lim} トークン（印の語を優先）、"
+                     f"届く {n_reach}/{plan.words} 語{marked}、届かない {n_miss} 語")
+        if n_miss:
+            warn = (f"  [WARN] initial_prompt が {lim} トークンに収まらないため、{n_miss} 語は Whisper に予告しません"
+                    "（置き換えと校閲には使います）")
+            if (plan.marked_reached or 0) < plan.marked:
+                warn += f"。印の語のうち {plan.marked - (plan.marked_reached or 0)} 語も入りません"
+            lines.append(warn)
+    else:
+        lines.append(f"[A] initial_prompt {plan.tokens}/{lim} トークン、届く {n_reach}/{plan.words} 語{marked}")
+    if n_miss:
+        lines.append("  届かない語: " + "、".join(plan.missed or []))
+    return lines
+
+
+def chunk_output_cap(prompt_tokens: int) -> int:
+    """1 チャンクの出力の上限: min(448 - len(prompt) + 1, 448 // 2)（#3 §2 の 3b、#4 の U3）。
+
+    len(prompt) は sot_prev + 使う prompt（後ろ 223 まで）+ sot・言語・task + no_timestamps。prompt が無ければ 4。
+    """
+    used = min(max(prompt_tokens, 0), PROMPT_MAX_TOKENS)
+    prompt_len = (used + 5) if used else 4
+    return min(WHISPER_MAX_LENGTH - prompt_len + 1, WHISPER_MAX_LENGTH // 2)
+
+
+def chunk_log_lines(segments: list[dict], encode, prompt_tokens: int) -> list[str]:
+    """チャンク（whisperx の 1 セグメント = VAD の 1 チャンク）ごとの出力のトークン数のコンソールの行。
+
+    セグメントの文を同じトークナイザで数え直した数なので、Whisper が出したトークンの数とは少し違うことがある。
+    """
+    if not segments:
+        return []
+    counts = [len(encode(seg.get("text") or "")[0]) if (seg.get("text") or "") else 0 for seg in segments]
+    top, cap = max(counts), chunk_output_cap(prompt_tokens)
+    lines = [f"[A] チャンクの出力（数え直し）: 最大 {top} トークン / {len(counts)} チャンク（1 チャンクの上限 {cap}）"]
+    over = sum(1 for c in counts if c > CHUNK_OUTPUT_WARN_TOKENS)
+    if over:
+        lines.append(f"  [WARN] 1 チャンクの出力が {CHUNK_OUTPUT_WARN_TOKENS} トークンを超えました（{over} チャンク、最大 {top}）。"
+                     f"上限 {cap} に当たると、そのチャンクの末尾は黙って切れます（数は文を数え直した目安）")
+    return lines
+
+
 def process_one(
     audio: Path,
     *,
@@ -244,8 +318,14 @@ def process_one(
     w = cfg["whisper"]
     gap_sec = float(cfg["formatting"]["paragraph_gap_sec"])
 
-    # A: glossary を initial_prompt で予告
-    initial_prompt = build_initial_prompt(entries) if entries else ""
+    # A: glossary を initial_prompt で予告。Whisper が使うのは後ろ 223 トークンまで（#1）。
+    # prompt はモデルを読むときに渡すので、トークン数はその前に、モデルと同じ tokenizer.json で数える。
+    # 印（"priority": true）の無い辞書は build_initial_prompt と同じ文字列（0.5.0 と同じ）で、変わるのはログだけ。
+    encode, encode_note = load_prompt_encoder(w["model"])
+    plan = plan_initial_prompt(entries, encode) if entries else None
+    for line in prompt_log_lines(plan, encode_note) if plan else []:
+        print(line)
+    initial_prompt = plan.text if plan else ""
 
     result = transcribe_audio(
         audio,
@@ -257,6 +337,9 @@ def process_one(
         device=device,
         initial_prompt=initial_prompt,
     )
+    if encode is not None:  # チャンクの出力の数（#3 の保留: 1 チャンク 224 トークンの頭打ち）
+        for line in chunk_log_lines(result["segments"], encode, (plan.tokens or 0) if plan else 0):
+            print(line)
 
     # 置き換え (B) の前の文（Whisper の出力そのまま）。置き換えが 1 箇所以上あれば md の節に残す。
     # apply_replacements_to_segments は segments を書き換えず、新しい list を返す。
