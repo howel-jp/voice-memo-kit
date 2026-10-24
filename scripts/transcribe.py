@@ -45,10 +45,19 @@ from glossary import (
     load_glossary,
     merge_glossaries,
 )
-from proofread import proofread_body
+from proofread import describe_failure, proofread_body
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
 AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".mp4"}
+
+# 出力 md の <details> の見出し（SKILL.md §3 に同じ文を書く）。
+# 校閲前: 辞書の置き換え (B) の後・校閲 (C) の前の文。本文が校閲後のときだけ付く。
+# 置き換え前: Whisper の出力そのまま (B の前)。置き換えが 1 箇所以上あったときだけ付く
+#   （0 箇所なら、本文か校閲前の節と同じ文になるため）。
+PRE_PROOFREAD_SUMMARY = "校閲前（辞書の置き換え後）"
+PRE_REPLACEMENT_SUMMARY = "置き換え前（Whisper の出力）"
+# frontmatter の proofread_error_detail の長さの上限（改行は除く）
+ERROR_DETAIL_MAX_CHARS = 200
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -173,6 +182,16 @@ def fmt_duration(sec: float) -> str:
     return f"{int(sec // 60):02d}:{int(sec % 60):02d}"
 
 
+def details_section(summary: str, text: str) -> str:
+    """出力 md の折りたたみの節（本文の後ろに続ける）。"""
+    return f"\n\n<details>\n<summary>{summary}</summary>\n\n{text}\n\n</details>\n"
+
+
+def one_line(text: str, limit: int = ERROR_DETAIL_MAX_CHARS) -> str:
+    """frontmatter に書く 1 行にする（空白と改行を 1 つの空白にまとめ、limit 字で切る）。"""
+    return " ".join(str(text).split())[:limit]
+
+
 def unique_path(path: Path) -> Path:
     if not path.exists():
         return path
@@ -239,6 +258,10 @@ def process_one(
         initial_prompt=initial_prompt,
     )
 
+    # 置き換え (B) の前の文（Whisper の出力そのまま）。置き換えが 1 箇所以上あれば md の節に残す。
+    # apply_replacements_to_segments は segments を書き換えず、新しい list を返す。
+    pre_replacement_body = format_body(result["segments"], gap_sec, with_timestamps)
+
     # B: wrong_variants → canonical 置換
     replacement_count = 0
     if entries:
@@ -250,24 +273,28 @@ def process_one(
     plain_body = format_body(result["segments"], gap_sec, with_timestamps=False)
 
     # C: Claude による文脈校閲。失敗しても文字起こしは失わない。
+    # proofread はモデル名 = 本文が校閲後。それ以外は false で、本文は校閲前（辞書の置き換え後）。
     proofread_status = "false"
+    proofread_error: tuple[str, str] | None = None  # (理由の語, 1 行の補足)。校閲を試みて使わなかったときだけ
     main_body = raw_display_body
     raw_section = ""
-    if use_proofread:
+    if use_proofread and not plain_body.strip():
+        print("[C] 文字起こしが空のため、校閲しません")
+    elif use_proofread:
         canonicals = [e["canonical"] for e in entries if e.get("canonical")]
         model = cfg.get("proofread", {}).get("model", "claude-sonnet-4-6")
         try:
             print(f"[C] Claude 校閲中（{model}）...")
             main_body = proofread_body(plain_body, canonicals, model=model)
             proofread_status = model
-            raw_section = (
-                "\n\n<details>\n<summary>校閲前（文字起こし生データ）</summary>\n\n"
-                + raw_display_body
-                + "\n\n</details>\n"
-            )
+            raw_section = details_section(PRE_PROOFREAD_SUMMARY, raw_display_body)
             print("[C] 校閲完了")
         except Exception as e:
-            print(f"  [WARN] 校閲に失敗、生の文字起こしを使用します: {e}")
+            code, detail = describe_failure(e)
+            proofread_error = (code, one_line(detail))
+            print(f"  [WARN] 校閲に失敗（{code}: {proofread_error[1]}）、校閲前の文字起こしを使用します: {e}")
+    if replacement_count > 0:
+        raw_section += details_section(PRE_REPLACEMENT_SUMMARY, pre_replacement_body)
 
     date = datetime.datetime.fromtimestamp(audio.stat().st_mtime).strftime("%Y-%m-%d")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -282,8 +309,14 @@ def process_one(
         f"segments: {len(result['segments'])}\n"
         f"glossary_replacements: {replacement_count}\n"
         f"proofread: {proofread_status}\n"
-        "---\n\n"
     )
+    if proofread_error:
+        # detail は JSON の文字列の形（YAML の二重引用符の文字列としても読める）
+        frontmatter += (
+            f"proofread_error: {proofread_error[0]}\n"
+            f"proofread_error_detail: {json.dumps(proofread_error[1], ensure_ascii=False)}\n"
+        )
+    frontmatter += "---\n\n"
     out_path.write_text(
         frontmatter + f"# ボイスメモ {date}\n\n" + main_body + "\n" + raw_section,
         encoding="utf-8",

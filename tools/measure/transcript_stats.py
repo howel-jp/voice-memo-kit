@@ -7,6 +7,8 @@
 
 数える本文: 校閲前の `<details>` (キットが校閲に成功したときに付ける。置き換え後・校閲前の文) があればそれを、
 無ければ本文 (校閲していない文か、校閲後の文) を数える。`[mm:ss] ` の印と空白・改行は数えない。
+本文の側は、最初の `<details>` の前までを数える (0.4.0 から、校閲しなかった md にも
+「置き換え前」の `<details>` が付くことがあるため。#8)。
 import しただけでは何もしない。
 """
 from __future__ import annotations
@@ -48,7 +50,8 @@ def parse_transcript(text: str) -> dict | None:
     if d:
         counted, source = d.group(1), "details"
     else:
-        lines = body.strip().splitlines()
+        cut = body.find("<details>")
+        lines = (body if cut < 0 else body[:cut]).strip().splitlines()
         if lines and lines[0].startswith("# "):
             lines = lines[1:]
         counted, source = "\n".join(lines), "body"
