@@ -165,6 +165,36 @@ class IncompleteResultTest(_Patched):
         self.assertEqual(p.count_paragraphs("a\n\nb\n \nc\n\n\n\nd\n"), 4)
         self.assertEqual(p.count_paragraphs("a\nb"), 1)
         self.assertEqual(p.count_paragraphs("  "), 0)
+        # PR #9 のレビュー 1 回目の任意 1: CRLF・CR と、空白だけの行 (全角空白・nbsp・タブ) も段落の区切り
+        self.assertEqual(p.count_paragraphs("a\r\n\r\nb\r\n\r\nc"), 3)
+        self.assertEqual(p.count_paragraphs("a\r\rb"), 2)
+        self.assertEqual(p.count_paragraphs("a\n\u3000\nb\n\u00a0\nc\n\t\nd"), 4)
+        self.assertEqual(p.count_paragraphs("a\r\nb"), 1)  # 1 つの改行は段落の区切りではない
+
+    def test_crlf_reply_is_accepted_and_normalized(self):
+        # CRLF の返りを、段落 72 → 1 と数えて誤って捨てない。返す文の改行は LF にそろえる
+        self._stub(self.BODY.replace("\n", "\r\n"))
+        out = p.proofread_body(self.BODY, [])
+        self.assertEqual(out, self.BODY)
+        self.assertNotIn("\r", out)
+
+    def test_check_order_empty_then_num_turns_then_ratio_then_paragraphs(self):
+        # PR #9 のレビュー 1 回目の任意 3: 判定の順 (空 → num_turns → 比 → 段落) を固定する
+        short_and_fewer = "\n\n".join(_paras(10))  # 比 0.14、段落 72 → 10
+        cases = [
+            ("", 3, p.ProofreadEmpty, "空の結果"),
+            (short_and_fewer, 3, p.ProofreadIncomplete, "num_turns 3"),
+            (short_and_fewer, 1, p.ProofreadTooShort, None),
+            (self.FRONT_DROPPED, 1, p.ProofreadIncomplete, "段落 72 → 45"),
+        ]
+        for reply, turns, exc_type, detail in cases:
+            with self.subTest(exc=exc_type.__name__, turns=turns):
+                self._stub(reply, num_turns=turns)
+                with self.assertRaises(p.ProofreadRejected) as cm:
+                    p.proofread_body(self.BODY, [])
+                self.assertIs(type(cm.exception), exc_type)
+                if detail is not None:
+                    self.assertEqual(cm.exception.detail, detail)
 
 
 class DescribeFailureTest(unittest.TestCase):
@@ -231,6 +261,16 @@ class CallClaudeJsonTest(unittest.TestCase):
             p._call_claude_json("S", "U", "m")
         self.assertEqual(cm.exception.detail, "is_error (subtype error_during_execution, num_turns 4)")
         self.assertEqual(p.describe_failure(cm.exception)[0], "cli_error")
+
+    def test_is_error_detail_omits_missing_fields(self):
+        # PR #9 のレビュー 1 回目の任意 4: JSON に無い値を「None」と書かない
+        for payload, detail in (({"is_error": True, "num_turns": 4}, "is_error (num_turns 4)"),
+                                ({"is_error": True}, "is_error")):
+            with self.subTest(detail=detail):
+                self._run(json.dumps(payload))
+                with self.assertRaises(p.ClaudeCLIError) as cm:
+                    p._call_claude_json("S", "U", "m")
+                self.assertEqual(cm.exception.detail, detail)
 
     def test_nonzero_exit_detail_has_no_stderr(self):
         self._run("", returncode=1, stderr="合成の stderr の文")

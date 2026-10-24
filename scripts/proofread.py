@@ -145,9 +145,10 @@ def _call_claude_json(system_prompt: str, user_message: str, model: str) -> dict
         )
     if data.get("is_error"):
         head = str(data.get("result") or "")[:300]
+        parts = [f"{k} {data[k]}" for k in ("subtype", "num_turns") if data.get(k) is not None]
         raise ClaudeCLIError(
             f"Claude error (subtype={data.get('subtype')}, num_turns={data.get('num_turns')}): {head}",
-            detail=f"is_error (subtype {data.get('subtype')}, num_turns {data.get('num_turns')})",
+            detail="is_error" + (f" ({', '.join(parts)})" if parts else ""),
         )
     return data
 
@@ -162,13 +163,19 @@ _TRAILING_NOTE_RE = re.compile(
 )
 
 
+def _normalize_newlines(text: str) -> str:
+    """CRLF と CR を LF にそろえる。"""
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
 def _strip_wrapping(text: str) -> str:
     """前置き・コードフェンス・末尾の校閲メモを保険で除去する。
 
     モデルが規律に反して本文の後ろに「---\\n修正3点：…」のような注記を付けることがある
     （2026-08-25 に観測）。区切り線の後に修正/校閲/注記で始まるブロックが続く場合は本文から落とす。
+    改行は LF にそろえる（CRLF の返りで段落の数を数え違えず、md に \\r を残さないため）。
     """
-    t = text.strip()
+    t = _normalize_newlines(text).strip()
     if t.startswith("```"):
         lines = [ln for ln in t.split("\n") if not ln.strip().startswith("```")]
         t = "\n".join(lines).strip()
@@ -214,12 +221,15 @@ class ProofreadIncomplete(ProofreadRejected):
 # レベルB（フィラー除去＋軽い整え）なら 2〜3 割減が上限の目安。
 MIN_LENGTH_RATIO = 0.6
 
-_PARAGRAPH_SPLIT_RE = re.compile(r"\n[ \t　]*\n")
+_PARAGRAPH_SPLIT_RE = re.compile(r"\n\s*\n")
 
 
 def count_paragraphs(text: str) -> int:
-    """空行で区切った段落の数（transcribe.format_body は段落を空行でつなぐ）。"""
-    return len([p for p in _PARAGRAPH_SPLIT_RE.split(text.strip()) if p.strip()])
+    """空行（空白だけの行を含む）で区切った段落の数（transcribe.format_body は段落を空行でつなぐ）。
+
+    CRLF・CR は LF にそろえてから数える。
+    """
+    return len([p for p in _PARAGRAPH_SPLIT_RE.split(_normalize_newlines(text).strip()) if p.strip()])
 
 
 def _as_int(value) -> int | None:

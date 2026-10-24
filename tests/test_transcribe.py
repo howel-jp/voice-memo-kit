@@ -278,7 +278,7 @@ class ProcessOneTest(unittest.TestCase):
                 entries=self.ENTRIES if entries is None else entries, with_timestamps=with_timestamps,
                 keep=True, device="cpu", use_proofread=use_proofread,
             )
-        return self._parse(out.read_text(encoding="utf-8"))
+        return {**self._parse(out.read_text(encoding="utf-8")), "raw": out.read_bytes()}
 
     @staticmethod
     def _parse(md: str) -> dict:
@@ -411,6 +411,31 @@ class ProcessOneTest(unittest.TestCase):
         self.assertEqual(r["keys"], self.KEYS)  # 校閲を試みていないので理由のキーは付かない
         self.assertEqual(r["fm"]["proofread"], "false")
         self.assertEqual((r["body"], r["summaries"]), ("", []))
+
+    def test_crlf_reply_is_proofread_and_written_without_cr_doubling(self):
+        # PR #9 のレビュー 1 回目の任意 1: CRLF の返りを incomplete で捨てず、md に \r を重ねない
+        self._cli(lambda b: b.replace("えーと、", "").replace("\n", "\r\n"))
+        r = self._run()
+        self.assertEqual(r["fm"]["proofread"], self.model)
+        self.assertNotIn("proofread_error", r["fm"])
+        self.assertEqual(r["body"], self.REPLACED.replace("えーと、", ""))
+        self.assertNotIn(b"\r\r", r["raw"])
+
+
+class HeadingDocsTest(unittest.TestCase):
+    """PR #9 のレビュー 1 回目の任意 2: <details> の見出しの文を、SKILL.md・README.md と結ぶ (C5-d)。"""
+
+    def test_headings_are_documented(self):
+        for doc in ("SKILL.md", "README.md"):
+            text = (Path(t.SKILL_DIR) / doc).read_text(encoding="utf-8")
+            for summary in (t.PRE_PROOFREAD_SUMMARY, t.PRE_REPLACEMENT_SUMMARY):
+                with self.subTest(doc=doc, summary=summary):
+                    self.assertIn(summary, text)
+
+    def test_pre_proofread_heading_keeps_its_prefix(self):
+        # tools/measure/transcript_stats.py は <summary>校閲前…</summary> で当てる (0.3.x の md も同じ先頭)
+        self.assertTrue(t.PRE_PROOFREAD_SUMMARY.startswith("校閲前"))
+        self.assertFalse(t.PRE_REPLACEMENT_SUMMARY.startswith("校閲前"))
 
 
 if __name__ == "__main__":
