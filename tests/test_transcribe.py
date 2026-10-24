@@ -23,8 +23,17 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import engine  # noqa: E402
+import glossary  # noqa: E402
 import proofread  # noqa: E402
 import transcribe as t  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools" / "measure"))
+import synth  # noqa: E402  (合成の辞書。標準ライブラリだけ)
+
+
+def char_encoder(text: str):
+    """1 字 = 1 トークンのトークナイザの代わり (initial_prompt とチャンクの出力を数える)。"""
+    return list(range(len(text))), [(i, i + 1) for i in range(len(text))]
 
 
 def _cfg(project: Path, global_root: Path | None, extra: list[str] | None = None) -> dict:
@@ -200,8 +209,10 @@ class _FakeWhisperx(types.ModuleType):
     def __init__(self, segments: list[dict]):
         super().__init__("whisperx")
         self._segments = segments
+        self.asr_options: list = []  # load_model に渡った asr_options
 
     def load_model(self, name, device, compute_type, language, asr_options=None):
+        self.asr_options.append(asr_options)
         segments = self._segments
 
         class _Model:
@@ -243,9 +254,22 @@ class _ProcessOneBase(unittest.TestCase):
         self.cfg = t.load_config(self.root)
         self.model = self.cfg["proofread"]["model"]
         self.cli_bodies: list[str] = []
+        self.cli_messages: list[str] = []
         engine.clear_model_cache()
         self.addCleanup(engine.clear_model_cache)
         patch = mock.patch.object(proofread, "find_claude_bin", lambda: Path("claude-stub.exe"))
+        patch.start()
+        self.addCleanup(patch.stop)
+        # initial_prompt を数えるトークナイザは差し替える (手元の HF キャッシュを読まない)
+        self.encoder_calls: list[str] = []
+        self.set_encoder(char_encoder, "")
+
+    def set_encoder(self, encode, note: str):
+        def fake_load(model_name="large-v3"):
+            self.encoder_calls.append(model_name)
+            return encode, note
+
+        patch = mock.patch.object(t, "load_prompt_encoder", fake_load)
         patch.start()
         self.addCleanup(patch.stop)
 
@@ -256,7 +280,9 @@ class _ProcessOneBase(unittest.TestCase):
         """
 
         def fake(cmd, *a, **k):
-            body = k["stdin"].read().split("【文字起こし本文】\n", 1)[1]
+            message = k["stdin"].read()
+            self.cli_messages.append(message)
+            body = message.split("【文字起こし本文】\n", 1)[1]
             self.cli_bodies.append(body)
             if timeout:
                 raise subprocess.TimeoutExpired(cmd, k["timeout"])
@@ -278,12 +304,15 @@ class _ProcessOneBase(unittest.TestCase):
     def _run(self, *, segs=None, entries=None, use_proofread=True, with_timestamps=False) -> dict:
         engine.clear_model_cache()
         fake = _FakeWhisperx(self.SEGS if segs is None else segs)
-        with mock.patch.dict(sys.modules, {"whisperx": fake}), contextlib.redirect_stdout(io.StringIO()):
+        buf = io.StringIO()
+        with mock.patch.dict(sys.modules, {"whisperx": fake}), contextlib.redirect_stdout(buf):
             out = t.process_one(
                 self.audio, cfg=self.cfg, processed_dir=self.root / "processed", out_dir=self.root / "out",
                 entries=self.ENTRIES if entries is None else entries, with_timestamps=with_timestamps,
                 keep=True, device="cpu", use_proofread=use_proofread,
             )
+        self.whisperx = fake
+        self.stdout = buf.getvalue()
         return {**self._parse(out.read_text(encoding="utf-8")), "raw": out.read_bytes()}
 
     @staticmethod
@@ -487,6 +516,230 @@ class ProcessOneChunkedTest(_ProcessOneBase):
         self.assertEqual(r["fm"]["proofread"], self.model)
         self.assertEqual(r["body"], self.replaced.replace("えーと、", ""))
         self.assertEqual(len(self.cli_bodies), 5)  # まとまり 3 つ + まとまり 2 のやり直し 2 つ
+
+
+class ProcessOnePromptTest(_ProcessOneBase):
+    """#1 (C1・C2): 文字起こしのたびに、initial_prompt のトークン数と届く語・届かない語の数がログに出る。
+
+    トークナイザは 1 字 1 トークンの代わり。辞書は合成 (tools/measure/synth.py の mixed 78 項目)。
+    """
+
+    MIXED78 = synth.mixed_entries(78, 0)
+
+    def _prompt(self) -> str:
+        opts = self.whisperx.asr_options[-1]
+        return opts["initial_prompt"] if opts else ""
+
+    def _lines(self) -> list[str]:
+        return self.stdout.splitlines()
+
+    def test_fits_logs_tokens_and_passes_the_050_string(self):
+        self._cli(lambda b: b)
+        r = self._run()
+        expected = glossary.build_initial_prompt(self.ENTRIES)
+        self.assertEqual(self._prompt(), expected)
+        self.assertIn(f"[A] initial_prompt {len(' ' + expected)}/223 トークン、届く 1/1 語", self._lines())
+        self.assertNotIn("[WARN] initial_prompt", self.stdout)
+        self.assertNotIn("届かない語", self.stdout)
+        self.assertEqual(self.encoder_calls, [self.cfg["whisper"]["model"]])  # モデルと同じトークナイザ
+        self.assertEqual(r["keys"], self.KEYS)  # md の項目は変わらない
+
+    def test_overflow_without_marks_passes_the_050_string_and_warns(self):
+        self._cli(lambda b: b)
+        r = self._run(entries=self.MIXED78)
+        expected = glossary.build_initial_prompt(self.MIXED78)
+        self.assertEqual(self._prompt(), expected)  # 印の無い辞書は 0.5.0 と同じ文字列
+        plan = glossary.plan_initial_prompt(self.MIXED78, char_encoder)
+        n_reach, n_miss = len(plan.reached), len(plan.missed)
+        self.assertGreater(n_miss, 0)
+        lines = self._lines()
+        self.assertIn(f"[A] initial_prompt {len(' ' + expected)} トークン（Whisper が使うのは後ろ 223）、"
+                      f"届く {n_reach}/78 語、届かない {n_miss} 語", lines)
+        warn = [ln for ln in lines if "[WARN] initial_prompt" in ln]
+        self.assertEqual(len(warn), 1)
+        self.assertTrue(warn[0].startswith("  [WARN] initial_prompt が 223 トークンを超えるため"))
+        self.assertIn(f"前置きの文と {n_miss} 語は Whisper に届きません（置き換えと校閲には使います）", warn[0])
+        self.assertIn('"priority": true', warn[0])
+        self.assertIn("  届かない語: " + "、".join(plan.missed), lines)
+        self.assertEqual(r["keys"], self.KEYS)
+        # 届かない語も、校閲の canonical の一覧には全部渡す
+        canon_line = self.cli_messages[-1].split("【固有名詞 canonical 一覧（最優先で守る）】\n", 1)[1].split("\n", 1)[0]
+        self.assertEqual(canon_line, "、".join(e["canonical"] for e in self.MIXED78))
+
+    def test_overflow_with_marks_passes_the_selected_prompt(self):
+        entries = [dict(e, priority=True) if i % 4 == 0 else dict(e) for i, e in enumerate(self.MIXED78)]
+        self._cli(lambda b: b)
+        r = self._run(entries=entries)
+        plan = glossary.plan_initial_prompt(entries, char_encoder)
+        self.assertTrue(plan.selected)
+        self.assertEqual(self._prompt(), plan.text)
+        self.assertLessEqual(len(" " + plan.text), 223)
+        lines = self._lines()
+        self.assertIn(f"[A] initial_prompt {plan.tokens}/223 トークン（印の語を優先）、"
+                      f"届く {len(plan.reached)}/78 語（うち印 20/20）、届かない {len(plan.missed)} 語", lines)
+        warn = [ln for ln in lines if "[WARN] initial_prompt" in ln]
+        self.assertEqual(warn, [f"  [WARN] initial_prompt が 223 トークンに収まらないため、{len(plan.missed)} 語は Whisper に"
+                                "予告しません（置き換えと校閲には使います）"])
+        self.assertIn("  届かない語: " + "、".join(plan.missed), lines)
+        self.assertEqual(r["keys"], self.KEYS)
+
+    def test_no_single_word_fits_passes_no_prompt(self):
+        # PR #11 のレビュー 1 回目の任意 1: 1 語も入らないときは prompt を渡さない (asr_options なし)。辞書は B・C に使う
+        entries = [{"canonical": "ア" * 300, "priority": True}, {"canonical": "イ" * 250}]
+        self._cli(lambda b: b)
+        r = self._run(entries=entries)
+        self.assertIsNone(self.whisperx.asr_options[-1])
+        self.assertIn("[A] initial_prompt 0/223 トークン（印の語を優先）、届く 0/2 語（うち印 0/1）、届かない 2 語",
+                      self._lines())
+        canon_line = self.cli_messages[-1].split("【固有名詞 canonical 一覧（最優先で守る）】\n", 1)[1].split("\n", 1)[0]
+        self.assertEqual(canon_line, "ア" * 300 + "、" + "イ" * 250)
+        self.assertEqual(r["keys"], self.KEYS)
+
+    def test_not_countable_warns_and_passes_the_050_string(self):
+        self.set_encoder(None, "合成の理由")
+        self._cli(lambda b: b)
+        self._run(entries=self.MIXED78)
+        self.assertEqual(self._prompt(), glossary.build_initial_prompt(self.MIXED78))
+        self.assertIn("  [WARN] initial_prompt のトークン数を数えられません（合成の理由）。"
+                      "Whisper が使うのは後ろ 223 トークンまでで、届く語の数は分かりません", self._lines())
+        self.assertNotIn("[A] initial_prompt", self.stdout)
+        self.assertNotIn("[A] チャンクの出力", self.stdout)
+
+    def test_no_glossary_has_no_prompt_line_but_logs_chunks(self):
+        self._cli(lambda b: b)
+        self._run(entries=[])
+        self.assertIsNone(self.whisperx.asr_options[-1])
+        self.assertNotIn("initial_prompt", self.stdout)
+        top = max(len(s["text"]) for s in self.SEGS)
+        self.assertIn(f"[A] チャンクの出力（数え直し）: 最大 {top} トークン / 3 チャンク（1 チャンクの上限 224）", self._lines())
+        self.assertNotIn("[WARN] 1 チャンク", self.stdout)
+
+    def test_chunk_over_200_tokens_warns_with_the_cap_for_a_full_prompt(self):
+        segs = [{"start": 0.0, "end": 2.0, "text": "あ" * 210 + "。"}, {"start": 3.0, "end": 4.0, "text": "短い。"}]
+        self._cli(lambda b: b)
+        self._run(segs=segs, entries=self.MIXED78)  # prompt は 223 を超える → 1 チャンクの上限は 221
+        lines = self._lines()
+        self.assertIn("[A] チャンクの出力（数え直し）: 最大 211 トークン / 2 チャンク（1 チャンクの上限 221）", lines)
+        self.assertIn("  [WARN] 1 チャンクの出力が 200 トークンを超えました（1 チャンク、最大 211）。"
+                      "上限 221 に当たると、そのチャンクの末尾は黙って切れます（数は文を数え直した目安）", lines)
+
+
+class PromptLogLinesTest(unittest.TestCase):
+    """prompt_log_lines の、process_one のテストで通らない形と、チャンクの出力の上限。"""
+
+    def test_only_the_prefix_is_cut(self):
+        plan = glossary.PromptPlan("合成", 230, 2, ["ゾルマ", "Qantrel"], [], False, 0, 0, False)
+        lines = t.prompt_log_lines(plan)
+        self.assertEqual(lines[0], "[A] initial_prompt 230 トークン（Whisper が使うのは後ろ 223）、届く 2/2 語、届かない 0 語")
+        self.assertEqual(lines[1], "  [WARN] initial_prompt が 223 トークンを超えるため、前置きの文の前の方は Whisper に届きません"
+                                   "（語は全部届きます）")
+        self.assertEqual(len(lines), 2)
+
+    def test_marked_words_that_do_not_fit_are_counted(self):
+        plan = glossary.PromptPlan("合成", 220, 40, ["A"] * 15, ["B"] * 25, True, 40, 15, True)
+        lines = t.prompt_log_lines(plan)
+        self.assertEqual(lines[0], "[A] initial_prompt 220/223 トークン（印の語を優先）、届く 15/40 語（うち印 15/40）、届かない 25 語")
+        self.assertTrue(lines[1].endswith("。印の語のうち 25 語は入りません"))
+
+    def test_one_missed_marked_word_does_not_read_as_none_reached(self):
+        # PR #11 のレビュー 2 回目の任意 1: 入らない印の語が 1 語のとき「1 語も入りません」(= どれも入らない) と読めない文にする
+        plan = glossary.PromptPlan("合成", 222, 40, ["A"] * 37, ["B"] * 3, True, 38, 37, True)
+        lines = t.prompt_log_lines(plan)
+        self.assertIn("（うち印 37/38）", lines[0])
+        self.assertTrue(lines[1].endswith("。印の語のうち 1 語は入りません"), lines[1])
+        self.assertNotIn("語も入りません", lines[1])
+
+    def test_no_words_no_lines(self):
+        self.assertEqual(t.prompt_log_lines(glossary.plan_initial_prompt([], char_encoder)), [])
+
+    def test_missed_marked_words_are_shown(self):
+        # PR #11 のレビュー 1 回目の任意 2: 印があっても入らなかった語は、届かない語の一覧で「（印）」が付く
+        entries = [dict(e, priority=True) for e in synth.synth_entries("L", 40, 0)] + [{"canonical": "ゾルマ" * 50}]
+        marked = {e["canonical"] for e in entries if glossary.is_priority(e)}
+        plan = glossary.plan_initial_prompt(entries, char_encoder)
+        lines = t.prompt_log_lines(plan)
+        expected = "  届かない語: " + "、".join(w + ("（印）" if w in marked else "") for w in plan.missed)
+        self.assertEqual(lines[-1], expected)
+        self.assertIn("（印）", lines[-1])
+        self.assertIn("ゾルマ" * 50, lines[-1])  # 印の無い語は届かない語の一覧にあり、「（印）」は付かない
+        self.assertNotIn("ゾルマ" * 50 + "（印）", lines[-1])
+
+    def test_no_single_word_fits_logs_an_empty_prompt(self):
+        # PR #11 のレビュー 1 回目の任意 1: 1 語も入らないときは prompt が空で、ログは「届く 0/N 語」
+        entries = [{"canonical": "ア" * 300, "priority": True}, {"canonical": "イ" * 250}]
+        lines = t.prompt_log_lines(glossary.plan_initial_prompt(entries, char_encoder))
+        self.assertEqual(lines[0], "[A] initial_prompt 0/223 トークン（印の語を優先）、届く 0/2 語（うち印 0/1）、届かない 2 語")
+        self.assertTrue(lines[1].endswith("。印の語のうち 1 語は入りません"))
+        self.assertEqual(lines[2], "  届かない語: " + "ア" * 300 + "（印）、" + "イ" * 250)
+
+    def test_chunk_output_cap(self):
+        # 1 チャンクの出力 ≤ min(448 − len(prompt) + 1, 224)。len(prompt) = 使う prompt + 5 (無ければ 4)
+        for tokens, cap in ((0, 224), (1, 224), (220, 224), (221, 223), (222, 222), (223, 221), (620, 221)):
+            with self.subTest(tokens=tokens):
+                self.assertEqual(t.chunk_output_cap(tokens), cap)
+
+
+class PromptDocsTest(unittest.TestCase):
+    """#1 の C3: README に届く長さの目安と優先の付け方があり、ログの例がコードの出す行と同じ。SKILL.md は [WARN] を読む。"""
+
+    def setUp(self):
+        self.readme = (Path(t.SKILL_DIR) / "README.md").read_text(encoding="utf-8")
+        self.skill = (Path(t.SKILL_DIR) / "SKILL.md").read_text(encoding="utf-8")
+
+    def test_readme_has_the_rule_of_thumb_and_the_mark(self):
+        self.assertIn("223 トークン ≒ 前置きの文 24 トークン + 語およそ 25 語。語の長さで 18〜41 語", self.readme)
+        self.assertIn('"priority": true', self.readme)
+        self.assertIn("### initial_prompt の長さと、届ける語の優先", self.readme)
+
+    def test_readme_log_examples_are_what_the_code_prints(self):
+        over = glossary.PromptPlan("x", 620, 78, ["w"] * 28, ["v"] * 50, False, 0, 0, False)
+        examples = [  # (plan, 何行目, README で「。…」と略した所)
+            (glossary.PromptPlan("x", 113, 15, ["w"] * 15, [], True, 0, 0, False), 0, None),
+            (over, 0, None),
+            (over, 1, "。届けたい"),
+            (glossary.PromptPlan("x", 223, 78, ["w"] * 31, ["v"] * 47, True, 20, 20, True), 0, None),
+        ]
+        for plan, i, cut in examples:
+            line = t.prompt_log_lines(plan)[i]
+            shown = line if cut is None else line[: line.index(cut)] + "。…"
+            with self.subTest(line=shown):
+                self.assertIn(shown, self.readme)
+
+    def test_skill_md_reads_the_warn_lines(self):
+        self.assertIn("[WARN] initial_prompt", self.skill)
+        self.assertIn('"priority": true', self.skill)
+        self.assertIn("[WARN] 1 チャンクの出力が", self.skill)
+
+    def test_missed_marked_words_tail_is_the_same_in_code_and_docs(self):
+        # PR #11 のレビュー 2 回目の任意 1: 「印の語のうち N 語は入りません」を、コード・SKILL.md §5・README で同じ文にする
+        plan = glossary.PromptPlan("x", 222, 40, ["w"] * 37, ["v"] * 3, True, 38, 37, True)
+        warn = t.prompt_log_lines(plan)[1]
+        tail = warn[warn.rindex("。") + 1:]
+        self.assertEqual(tail, "印の語のうち 1 語は入りません")
+        for doc in (self.skill, self.readme):
+            self.assertIn("`印の語のうち N 語は入りません`", doc)
+            self.assertNotIn("語も入りません", doc)
+
+    def test_skill_md_separates_the_two_kinds_of_prompt_warn(self):
+        # PR #11 のレビュー 1 回目の推奨 1: SKILL.md §5 は 2 種類の [WARN] initial_prompt を分けて読む。
+        # コードの出す [WARN] initial_prompt の行が、どちらかの書き出しで始まることを結ぶ
+        over_prefix = "[WARN] initial_prompt が 223 トークン"
+        uncounted_prefix = "[WARN] initial_prompt のトークン数を数えられません"
+        self.assertIn(f"`{over_prefix}` で始まる行", self.skill)
+        self.assertIn(f"`{uncounted_prefix}` の行", self.skill)
+        self.assertIn("（印）", self.skill)
+        P = glossary.PromptPlan
+        plans = {
+            "over": (P("x", 620, 78, ["w"] * 28, ["v"] * 50, False, 0, 0, False), over_prefix),
+            "prefix_only": (P("x", 230, 2, ["w"] * 2, [], False, 0, 0, False), over_prefix),
+            "selected": (P("x", 220, 40, ["w"] * 15, ["v"] * 25, True, 40, 15, True), over_prefix),
+            "uncounted": (P("x", None, 78, None, None, None, 0, None, False), uncounted_prefix),
+        }
+        for name, (plan, prefix) in plans.items():
+            warns = [ln.strip() for ln in t.prompt_log_lines(plan, "合成の理由") if "[WARN] initial_prompt" in ln]
+            with self.subTest(name=name):
+                self.assertEqual(len(warns), 1)
+                self.assertTrue(warns[0].startswith(prefix), warns[0])
 
 
 class HeadingDocsTest(unittest.TestCase):

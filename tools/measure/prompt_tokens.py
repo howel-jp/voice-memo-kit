@@ -7,12 +7,21 @@ faster-whisper 1.2.1 (whisperx 3.8.5 が継承する) は、initial_prompt を `
 
     # U1: 合成の辞書 (語の長さ 4 通り × 項目数)
     python tools/measure/prompt_tokens.py synthetic
+    # #1: 印 ("priority": true) を 4 項目おきに付けた合成の辞書で、キットが渡す文字列 (kit_ の列) も数える
+    python tools/measure/prompt_tokens.py synthetic --priority-every 4
+    # #1 の C1: 辞書のディレクトリ (層の順) を渡し、キットのログと同じ数を出す (数だけ。語・パスは出さない)
+    python tools/measure/prompt_tokens.py dict <glossary-dir> [<glossary-dir> ...]
     # U2: 手元の実辞書。数だけを出す (語・パス・プロジェクト名は出さない)
     python tools/measure/prompt_tokens.py real --global-dir ~/voice_memos/glossary --projects-glob "C:/Projects/*"
 
 トークナイザは HF キャッシュの Systran/faster-whisper-large-v3 の tokenizer.json (ダウンロードしない)。
 --verify (既定) は、faster-whisper の `WhisperModel.get_prompt` を実際に通した prompt の長さと中身でも確かめる
 (数を 2 通りで確かめる)。import しただけでは、重い import・外部への接続・プロセスの起動をしない。
+
+0.5.0 の列 (tokens・reach・miss など) は、今までどおり `build_initial_prompt` の文字列 (全部の語、辞書の順) の数。
+kit_ の列は、0.6.0 のキットの `plan_initial_prompt` (#1) が Whisper に渡す文字列の数。kit_check は、kit_ の数を
+この道具の数え方で確かめた結果 (0.5.0 と同じ文字列なら 0.5.0 の列と同じ数、キットが選んだ文字列なら 223 以下で、
+届く語と前置きの文が文字列にあること)。
 """
 from __future__ import annotations
 
@@ -111,15 +120,58 @@ def prefix_standalone_tokens(encode) -> int:
     return len(ids)
 
 
+# --- #1: キットが Whisper に渡す文字列 (plan_initial_prompt) ------------------
+
+def kit_fields(entries: list[dict], encode, r050: dict, hf_tok=None) -> dict:
+    """キットの plan_initial_prompt (#1) が渡す文字列の数と、この道具の数え方での確かめ。数だけを返す。
+
+    r050 は同じ entries の analyze の結果 (0.5.0 の数)。
+    kit_check: 0.5.0 と同じ文字列なら、kit の数が analyze の数と同じ。キットが選んだ文字列なら、この道具の
+    トークナイザで数えて 223 以下、前置きの文で始まり、届く語がすべて文字列にあり、届かない語の数と足して全部の語になる。
+    """
+    plan = glossary.plan_initial_prompt(entries, encode)
+    same = plan.text == glossary.build_initial_prompt(entries)
+    if same:
+        check = (plan.tokens == r050["tokens"] and len(plan.reached) == r050["reach"]
+                 and len(plan.missed) == r050["miss"] and plan.prefix_reached == r050["prefix_reaches"])
+    else:
+        n = len(encode(" " + plan.text.strip())[0])
+        check = (n == plan.tokens and n <= KEEP and plan.text.startswith(PREFIX) and plan.prefix_reached
+                 and all(w in plan.text for w in plan.reached)
+                 and len(plan.reached) + len(plan.missed) == r050["items"])
+    out = {
+        "kit_same_as_050": same,
+        "kit_selected": plan.selected,
+        "kit_tokens": plan.tokens,
+        "kit_reach": len(plan.reached),
+        "kit_miss": len(plan.missed),
+        "kit_prefix": plan.prefix_reached,
+        "kit_marked": plan.marked,
+        "kit_marked_reach": plan.marked_reached,
+        "kit_check": bool(check),
+    }
+    if hf_tok is not None and plan.text:
+        v = verify_with_get_prompt(" " + plan.text.strip(), hf_tok)
+        out["kit_verify_kept"] = v["kept_by_get_prompt"]
+        # get_prompt が残すのは min(トークン数, 223)。キットが選んだ文字列なら全部 (= kit_tokens)
+        out["kit_verify_match"] = v["match"] and v["kept_by_get_prompt"] == min(plan.tokens, KEEP)
+    return out
+
+
+KIT_COLS = ["kit_same_as_050", "kit_selected", "kit_tokens", "kit_reach", "kit_miss", "kit_prefix",
+            "kit_marked", "kit_marked_reach", "kit_check"]
+
+
 # --- U1: 合成の辞書 ---------------------------------------------------------
 
-def synthetic_rows(encode, profiles, counts, seed: int = 0, hf_tok=None) -> list[dict]:
+def synthetic_rows(encode, profiles, counts, seed: int = 0, hf_tok=None, priority_every: int = 0) -> list[dict]:
     import synth
 
     rows = []
     for prof in profiles:
         for n in counts:
             entries = synth.mixed_entries(n, seed) if prof == "mixed" else synth.synth_entries(prof, n, seed)
+            entries = synth.mark_priority(entries, priority_every)
             r = analyze(entries, encode)
             r.pop("reach_flags")
             row = {"profile": prof, **r,
@@ -128,8 +180,35 @@ def synthetic_rows(encode, profiles, counts, seed: int = 0, hf_tok=None) -> list
                 v = verify_with_get_prompt(whisper_prompt_text(entries), hf_tok)
                 row["verify_kept"] = v["kept_by_get_prompt"]
                 row["verify_match"] = v["match"] and v["kept_by_get_prompt"] == r["kept"]
+            row.update(kit_fields(entries, encode, r, hf_tok))
             rows.append(row)
     return rows
+
+
+# --- #1 の C1: 辞書のディレクトリ (数だけ) ---------------------------------------
+
+def dict_rows(dirs: list[Path], encode, hf_tok=None) -> list[dict]:
+    """dirs を層の順 (後ろほど優先) にキットの load_glossary・merge_glossaries でマージし、数だけを返す。
+
+    語・パス・ファイル名は戻り値に入れない (キットの print も捨てる)。
+    """
+    layers = []
+    warns = 0
+    for d in dirs:
+        entries, w = _quiet(glossary.load_glossary, d)
+        layers.append(entries)
+        warns += w
+    merged = glossary.merge_glossaries(*[l for l in layers if l]) if any(layers) else []
+    r = analyze(merged, encode)
+    r.pop("reach_flags")
+    row = {"layer_items": [len(l) for l in layers], "merged_items": r["items"], "tokens": r["tokens"],
+           "kept": r["kept"], "dropped": r["dropped"], "reach": r["reach"], "miss": r["miss"],
+           "prefix_reaches": r["prefix_reaches"], "parse_warnings": warns}
+    if hf_tok is not None and merged:
+        row.update(_verify_fields(merged, r, hf_tok))
+    if merged:
+        row.update(kit_fields(merged, encode, r, hf_tok))
+    return [row]
 
 
 def max_items_all_reach(encode, profile: str, seed: int = 0, limit: int = 300) -> int:
@@ -260,7 +339,7 @@ def _table(rows: list[dict], cols: list[str]) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="initial_prompt のトークン数と届く語の数 (#4 U1・U2)")
+    ap = argparse.ArgumentParser(description="initial_prompt のトークン数と届く語の数 (#4 U1・U2、#1)")
     ap.add_argument("--tokenizer", type=Path, default=None, help="tokenizer.json (省略時は HF キャッシュ)")
     ap.add_argument("--no-verify", action="store_true", help="get_prompt での確かめを省く")
     ap.add_argument("--json", type=Path, default=None, help="結果の JSON の書き出し先")
@@ -269,6 +348,10 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--profiles", default="S,M,L,E,mixed")
     s.add_argument("--counts", default="1,5,10,20,30,40,50,60,78,100")
     s.add_argument("--seed", type=int, default=0)
+    s.add_argument("--priority-every", type=int, default=0,
+                   help='#1: N 項目おき (先頭から) に "priority": true を付ける (0 なら付けない)')
+    dd = sub.add_parser("dict", help="#1 の C1: 辞書のディレクトリ (層の順。数だけ)")
+    dd.add_argument("dirs", type=Path, nargs="+")
     r = sub.add_parser("real", help="U2: 手元の実辞書 (数だけ)")
     r.add_argument("--global-dir", type=Path, default=None)
     r.add_argument("--projects-glob", default=None, help='例: "C:/Projects/*"')
@@ -281,19 +364,28 @@ def main(argv: list[str] | None = None) -> int:
     verify_tok = None if args.no_verify else hf_tok
     print(f"tokenizer: {_kit.DEFAULT_MODEL_REPO} tokenizer.json (keep={KEEP})")
     print(f"prefix tokens: standalone={prefix_standalone_tokens(encode)}")
+    verify_cols = ["verify_kept", "verify_match"] if verify_tok else []
+    kit_cols = KIT_COLS + (["kit_verify_kept", "kit_verify_match"] if verify_tok else [])
 
     out: dict = {"keep": KEEP}
     if args.cmd == "synthetic":
         profiles = [p for p in args.profiles.split(",") if p]
         counts = [int(c) for c in args.counts.split(",") if c]
-        rows = synthetic_rows(encode, profiles, counts, args.seed, verify_tok)
+        rows = synthetic_rows(encode, profiles, counts, args.seed, verify_tok, args.priority_every)
+        print(f"priority every: {args.priority_every}")
         print(_table(rows, ["profile", "items", "avg_canonical_chars", "chars", "tokens", "kept", "dropped",
-                            "reach", "miss", "prefix_reaches", "prefix_tokens"]
-                     + (["verify_kept", "verify_match"] if verify_tok else [])))
+                            "reach", "miss", "prefix_reaches", "prefix_tokens"] + verify_cols))
+        print(_table(rows, ["profile", "items"] + kit_cols))
         maxes = {p: max_items_all_reach(encode, p, args.seed) for p in profiles}
         print("max items (prefix + all items within the last 223 tokens): "
               + ", ".join(f"{p}={n}" for p, n in maxes.items()))
-        out.update({"rows": rows, "max_items_all_reach": maxes})
+        out.update({"priority_every": args.priority_every, "rows": rows, "max_items_all_reach": maxes})
+    elif args.cmd == "dict":
+        rows = dict_rows([d.expanduser() for d in args.dirs], encode, verify_tok)
+        print(_table(rows, ["layer_items", "merged_items", "tokens", "kept", "dropped", "reach", "miss",
+                            "prefix_reaches", "parse_warnings"] + verify_cols))
+        print(_table(rows, kit_cols))
+        out.update({"rows": rows})
     else:
         roots = find_project_roots(args.projects_glob) if args.projects_glob else []
         g = args.global_dir.expanduser() if args.global_dir else None
