@@ -15,6 +15,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -22,6 +23,9 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools" / "measure"))
 sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT / "tests"))
+
+import _import_guard  # noqa: E402
 
 import glossary  # noqa: E402
 import proofread  # noqa: E402
@@ -473,6 +477,42 @@ class ProofreadTimingTest(unittest.TestCase):
         self.assertIn("dry-run", buf.getvalue())
 
 
+class _ReusedAfterLook:
+    """プロセスの一覧の代わり。root 1 (claude.exe) の子は 5 (conhost.exe) と 6 (cmd.exe)。
+
+    6 は、スナップショットの後で作成時刻を 1 度読まれると、その PID が別のプロセス (作成 999) に回る
+    (見張りが見た後、止める前に PID が回った形)。次のスナップショットでは、また元の 6 が見える。
+    kill_if_same は本物 (terminate_if_same) と同じく、今の作成時刻が渡された値のときだけ止める。
+    """
+
+    BASE = {1: 100, 5: 110, 6: 120}
+
+    def __init__(self):
+        self.looked: set[int] = set()
+        self.killed: list[int] = []
+        self.on_snap = None
+
+    def snap(self):
+        self.looked.clear()
+        if self.on_snap is not None:
+            self.on_snap()
+        return [(1, 0, "claude.exe"), (5, 1, "conhost.exe"), (6, 1, "cmd.exe")]
+
+    def _now(self, pid):
+        return 999 if (pid == 6 and pid in self.looked) else self.BASE.get(pid)
+
+    def ctime_of(self, pid):
+        ct = self._now(pid)
+        self.looked.add(pid)
+        return ct
+
+    def kill_if_same(self, pid, ct):
+        if self._now(pid) != ct:
+            return False
+        self.killed.append(pid)
+        return True
+
+
 class TimeoutWaitTest(unittest.TestCase):
     def test_verified_descendants(self):
         procs = [(1, 0, "root.exe"), (2, 1, "child.exe"), (3, 2, "grand.exe"), (4, 9, "other.exe"),
@@ -490,8 +530,15 @@ class TimeoutWaitTest(unittest.TestCase):
         state = {"procs": [(1, 0, "claude.exe"), (5, 1, "conhost.exe"), (6, 1, "cmd.exe")],
                  "ct": {1: 100, 5: 110, 6: 120}}
         killed = []
+
+        def kill_if_same(pid, ct):  # 本物 (terminate_if_same) と同じく、今の作成時刻が ct のときだけ止める
+            if state["ct"].get(pid) != ct:
+                return False
+            killed.append(pid)
+            return True
+
         w = tw.Watch([1], snap=lambda: state["procs"], ctime_of=lambda pid: state["ct"].get(pid),
-                     kill=lambda pid: killed.append(pid) or True)
+                     kill_if_same=kill_if_same, clock=lambda: None)
         w.seen.update(w.alive_descendants())
         self.assertEqual(set(w.seen), {5, 6})
         # root が終わり、5 は同じ名前の無関係のプロセス (親も作成時刻も別) が再利用。6 は親が消えた本物の子孫
@@ -511,6 +558,77 @@ class TimeoutWaitTest(unittest.TestCase):
         procs = [(1, 0, "new.exe"), (9, 1, "x.exe"), (6, 1, "ours.exe")]
         ct = {1: 500, 9: 600, 6: 120}.get
         self.assertEqual(tw.verified_descendants(procs, 1, 100, ct), {6: ("ours.exe", 120)})
+
+    def test_pid_reused_after_the_snapshot_is_not_ours(self):
+        """PR #7 のレビュー 2 回目の任意 1 の (a): スナップショットの後、作成時刻を読むまでの間に PID が回った記録を含めない。"""
+        # スナップショットには 5 (conhost.exe) が root の子として載っている。作成時刻を読む前に 5 が終わり、
+        # その PID を別のプロセス (作成 300) が使った。スナップショットの直前の時刻は 200
+        procs = [(1, 0, "claude.exe"), (5, 1, "conhost.exe"), (6, 1, "cmd.exe")]
+        ct = {1: 100, 5: 300, 6: 120}.get
+        self.assertEqual(tw.verified_descendants(procs, 1, 100, ct), {5: ("conhost.exe", 300), 6: ("cmd.exe", 120)})
+        self.assertEqual(tw.verified_descendants(procs, 1, 100, ct, before=200), {6: ("cmd.exe", 120)})
+        # 孫も同じ (親を通っても、before より後に作られたものは含めない)
+        procs2 = procs + [(7, 6, "grand.exe")]
+        ct2 = {1: 100, 5: 300, 6: 120, 7: 250}.get
+        self.assertEqual(tw.verified_descendants(procs2, 1, 100, ct2, before=200), {6: ("cmd.exe", 120)})
+        # 境目 (PR #13 のレビュー 1 回目の任意 1): before と同じ刻みに作られたものは含めない (次の見回りで拾う)
+        self.assertEqual(tw.verified_descendants(procs, 1, 100, ct, before=120), {})
+        self.assertEqual(tw.verified_descendants(procs, 1, 100, ct, before=121), {6: ("cmd.exe", 120)})
+        # Watch は、スナップショットの直前に時計を読み、その値を before にする
+        order = []
+        w = tw.Watch([1], snap=lambda: order.append("snap") or procs, ctime_of=lambda pid: order.append(pid) or ct(pid),
+                     kill_if_same=lambda pid, c: False, clock=lambda: order.append("clock") or 200)
+        self.assertEqual(w.alive_descendants(), {6: ("cmd.exe", 120)})
+        self.assertLess(order.index("clock"), order.index("snap"))
+
+    def test_grace_stop_kills_with_the_ctime_seen(self):
+        """PR #7 のレビュー 2 回目の任意 2 (R6): grace の止めは、見たときの作成時刻で止める (読み直さない)。"""
+        procs = _ReusedAfterLook()
+        w = tw.Watch([1], interval=0, snap=procs.snap, ctime_of=procs.ctime_of, kill_if_same=procs.kill_if_same,
+                     clock=lambda: None)
+        procs.on_snap = w.stop_flag.set  # 1 周だけ回す
+        w.deadline = time.perf_counter() - 1  # grace はもう過ぎた
+        w.run()
+        self.assertEqual(w.killed, {5: ("conhost.exe", 110)})
+        self.assertEqual(procs.killed, [5])  # 6 は見た後で別のプロセスに回ったので止めない
+
+    def test_cleanup_after_return_kills_with_the_ctime_seen(self):
+        """PR #7 のレビュー 2 回目の任意 2 (R7): 返った後の片付けも、見たときの作成時刻で止める。"""
+        procs = _ReusedAfterLook()
+        holder = {}
+
+        def make_watch(root_pids):
+            holder["root_pids"] = root_pids
+            return tw.Watch(root_pids, interval=0.005, snap=procs.snap, ctime_of=procs.ctime_of,
+                            kill_if_same=procs.kill_if_same, clock=lambda: None)
+
+        row = tw.timed_call(lambda: holder["root_pids"].append(1), timeout=60, grace=60, make_watch=make_watch)
+        self.assertEqual(row["status"], "returned")
+        self.assertFalse(row["hung_past_grace"])
+        self.assertEqual(row["left_after_return"], {"conhost.exe": 1, "cmd.exe": 1})
+        self.assertEqual(row["cleaned_after_return"], {"conhost.exe": 1})
+        self.assertEqual(procs.killed, [5])
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows のプロセスの作成時刻と TerminateProcess")
+    def test_terminate_if_same_on_a_real_process(self):
+        """PR #7 のレビュー 2 回目の任意 1 の (b): 作成時刻が違えば止めず、同じなら止める (同じハンドルで)。"""
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            ct = tw.process_create_time(child.pid)
+            self.assertIsNotNone(ct)
+            time.sleep(0.05)
+            now = tw.now_filetime()
+            self.assertIsNotNone(now)
+            self.assertLess(ct, now)  # 作成時刻と今の時刻は、比べられる同じ時計
+            self.assertFalse(tw.terminate_if_same(child.pid, ct + 1))
+            time.sleep(0.2)
+            self.assertIsNone(child.poll())
+            self.assertTrue(tw.terminate_if_same(child.pid, ct))
+            self.assertIsNotNone(child.wait(timeout=10))
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=10)
 
     def test_claude_mode_needs_flag(self):
         with mock.patch.object(subprocess, "Popen", side_effect=AssertionError("プロセスを起こした")):
@@ -541,30 +659,38 @@ class PromptBudgetPureTest(unittest.TestCase):
 
 
 class ImportSideEffectTest(unittest.TestCase):
+    # 塞ぐもの (プロセスの起動・ソケット・ctypes の DLL の読み込み) は tests/_import_guard.py の 1 か所 (#12)
+    MODULES = ["_kit", "synth", "prompt_tokens", "transcript_stats", "proofread_timing", "timeout_wait", "prompt_budget"]
+
     def test_import_is_light(self):
-        code = (
-            "import sys, os, subprocess, socket, ctypes\n"
-            "class Boom:\n"
-            "    def __init__(self, *a, **k): raise AssertionError('side effect on import')\n"
-            "class BoomLoader:\n"
-            "    def __getattr__(self, name): raise AssertionError('side effect on import')\n"
-            "def boom(*a, **k): raise AssertionError('side effect on import')\n"
-            "subprocess.Popen = Boom; socket.socket = Boom; socket.create_connection = boom\n"
-            # 任意 2 (b): os のプロセスの起動と ctypes の DLL の読み込みも塞ぐ
-            "for n in dir(os):\n"
-            "    if n.startswith(('spawn', 'exec')) or n in ('system', 'startfile', 'popen'):\n"
-            "        setattr(os, n, boom)\n"
-            "ctypes.CDLL = Boom; ctypes.WinDLL = Boom\n"
-            "ctypes.cdll = ctypes.windll = BoomLoader()\n"
-            f"sys.path.insert(0, {str(ROOT / 'tools' / 'measure')!r})\n"
-            "import _kit, synth, prompt_tokens, transcript_stats, proofread_timing, timeout_wait, prompt_budget\n"
-            "heavy = ['torch', 'whisperx', 'faster_whisper', 'ctranslate2', 'tokenizers', 'numpy', 'pyannote']\n"
-            "print(','.join(m for m in heavy if m in sys.modules))\n"
-        )
-        cp = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, encoding="utf-8",
-                            timeout=120)
+        cp = _import_guard.import_in_child(ROOT / "tools" / "measure", self.MODULES)
         self.assertEqual(cp.returncode, 0, cp.stderr)
-        self.assertEqual(cp.stdout.strip(), "")
+        self.assertEqual(cp.stdout.strip(), "loaded:")
+
+    @unittest.skipUnless(sys.platform == "win32", "WinDLL・OleDLL・windll・oledll は Windows だけ")
+    def test_the_guard_blocks_every_ctypes_loader(self):
+        """PR #7 のレビュー 2 回目の任意 3: CDLL の派生と LibraryLoader の全部を、import の時点で塞ぐ。"""
+        calls = ["ctypes.CDLL('kernel32')", "ctypes.WinDLL('kernel32')", "ctypes.OleDLL('ole32')",
+                 "ctypes.PyDLL('kernel32')", "ctypes.cdll.kernel32", "ctypes.windll.kernel32", "ctypes.oledll.ole32",
+                 "ctypes.pydll.kernel32", "ctypes.cdll.LoadLibrary('kernel32')"]
+        # 1 つの子プロセスで、module の直下で順に呼び、塞がれた (AssertionError になった) 数を出す
+        mod = (
+            "import ctypes\n"
+            f"CALLS = {calls!r}\n"
+            "blocked = []\n"
+            "for call in CALLS:\n"
+            "    try:\n"
+            "        eval(call)\n"
+            "    except AssertionError:\n"
+            "        blocked.append(call)\n"
+            "print('blocked:' + '|'.join(blocked))\n"
+        )
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "side_effect_mod.py").write_text(mod, encoding="utf-8")
+            cp = _import_guard.import_in_child(Path(d), ["side_effect_mod"])
+        self.assertEqual(cp.returncode, 0, cp.stderr)
+        blocked_line = next(ln for ln in cp.stdout.splitlines() if ln.startswith("blocked:"))
+        self.assertEqual(blocked_line[len("blocked:"):].split("|"), calls)
 
 
 if __name__ == "__main__":

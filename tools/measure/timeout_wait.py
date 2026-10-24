@@ -5,12 +5,17 @@ kill() は子だけを止めるので、孫プロセスが stderr の pipe を�
 
     # (a) 仕組み: 代わりの子プロセスで (Claude CLI は呼ばない)
     python tools/measure/timeout_wait.py stand-in --timeout 3 --sleep 20
-    # (b) 本物: キットの proofread._call_claude を、timeout だけ替えて呼ぶ (合成の文だけを送る)
+    # (b) 本物: キットの proofread_body (→ _call_claude_json) を、timeout だけ替えて呼ぶ (合成の文だけを送る)
     python tools/measure/timeout_wait.py claude --call-claude --timeout 15 --chars 8000
+
+(a) の代わりの子は、0.4.0 までのキットと同じく stderr を pipe で受ける (この待ちの仕組みを見るため)。
+0.5.0 からキットは stderr も一時ファイルに書くので、キットの経路ではこの待ちは起きない (#2。(b) はその経路を測る)。
 
 子孫のプロセスは Toolhelp のスナップショット (ctypes) で見る。記録するのは実行ファイル名だけ (引数は記録しない)。
 時間切れの後も残っていた子孫は、grace 秒を過ぎたら、その測りで起きた PID だけを止める
 (実行ファイル名と作成時刻が、見たときと同じものだけ。PID の再利用で別のプロセスを止めないため)。
+子孫に入れるのは、スナップショットの直前の時刻より前に作られたプロセスだけ。止めるときは、作成時刻の確かめと
+止める操作を同じハンドルで行う (PR #7 のレビュー 2 回目の任意 1。ミリ秒の窓で PID が回っても止めない)。
 import しただけでは、プロセスの起動も CLI の呼び出しもしない。
 """
 from __future__ import annotations
@@ -86,22 +91,50 @@ def process_create_time(pid: int) -> int | None:
     if not h:
         return None
     try:
-        times = [wintypes.FILETIME() for _ in range(4)]
-        if not k32.GetProcessTimes(wintypes.HANDLE(h), *[ctypes.byref(t) for t in times]):
-            return None
-        return (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+        return _handle_create_time(k32, h)
     finally:
         k32.CloseHandle(h)
 
 
+def _handle_create_time(k32, h) -> int | None:
+    """開いたハンドルのプロセスの作成時刻 (FILETIME、100ns 単位)。取れなければ None。"""
+    import ctypes
+    from ctypes import wintypes
+
+    times = [wintypes.FILETIME() for _ in range(4)]
+    if not k32.GetProcessTimes(wintypes.HANDLE(h), *[ctypes.byref(t) for t in times]):
+        return None
+    return (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+
+
+def now_filetime() -> int | None:
+    """今の時刻 (FILETIME、100ns 単位。作成時刻と比べられる時計)。Windows 以外では None。
+
+    GetSystemTimeAsFileTime は刻み (既定で約 15.6 ms) の頭に丸めた値を返すので、呼んだ時点より後にはならない。
+    """
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    ft = wintypes.FILETIME()
+    k32.GetSystemTimeAsFileTime(ctypes.byref(ft))
+    return (ft.dwHighDateTime << 32) | ft.dwLowDateTime
+
+
 def verified_descendants(procs: list[tuple[int, int, str]], root: int, root_ctime: int | None,
-                         ctime_of) -> dict[int, tuple[str, int]]:
+                         ctime_of, before: int | None = None) -> dict[int, tuple[str, int]]:
     """root の子孫 (root 自身は除く) を {pid: (実行ファイル名, 作成時刻)} で返す。
 
     Windows の親 PID は、親が終わった後も書き換わらず、PID は再利用される。そこで、親子の組ごとに
     「子の作成時刻 >= 親の作成時刻」を確かめ、親より前に作られたもの (別のプロセスが同じ PID を使っていた頃の子)
     と、作成時刻が取れないものは含めない。root の作成時刻が分からなければ空を返す。
     root が終わってその PID を別のプロセスが使っているときは、そのプロセスより後に作られた子も含めない。
+    before (スナップショットの直前の時刻) があれば、作成時刻が before より前のものだけを含める。スナップショットの後、
+    作成時刻を読むまでの間に PID が別のプロセスに回ると、そのプロセスの作成時刻は before より後になるので、
+    古い記録 (親子・名前) に新しいプロセスの作成時刻を付けない (PR #7 のレビュー 2 回目の任意 1 の (a))。
+    before と同じ刻みに作られたものは、次の見回りで拾う。
     """
     if root_ctime is None:
         return {}
@@ -119,14 +152,19 @@ def verified_descendants(procs: list[tuple[int, int, str]], root: int, root_ctim
             if pid in out or pid == root:
                 continue
             ct = ctime_of(pid)
-            if ct is None or ct < cur_ct or (upper is not None and ct >= upper):
+            if ct is None or ct < cur_ct or (upper is not None and ct >= upper) or (before is not None and ct >= before):
                 continue
             out[pid] = (exe, ct)
             stack.append((pid, ct, None))
     return out
 
 
-def terminate(pid: int) -> bool:
+def terminate_if_same(pid: int, ct: int) -> bool:
+    """pid のプロセスの作成時刻が ct のときだけ止める。止めたら True。
+
+    作成時刻の確かめと止める操作を、同じハンドルで行う。ハンドルを開いている間は、その PID が別のプロセスに
+    回らないので、確かめた後で別のプロセスを止めることが無い (PR #7 のレビュー 2 回目の任意 1 の (b))。
+    """
     if os.name != "nt":
         return False
     import ctypes
@@ -136,10 +174,12 @@ def terminate(pid: int) -> bool:
     k32.OpenProcess.restype = wintypes.HANDLE
     k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     k32.CloseHandle.argtypes = [wintypes.HANDLE]
-    h = k32.OpenProcess(0x0001, False, pid)  # PROCESS_TERMINATE
+    h = k32.OpenProcess(0x1000 | 0x0001, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE
     if not h:
         return False
     try:
+        if _handle_create_time(k32, h) != ct:
+            return False
         return bool(k32.TerminateProcess(wintypes.HANDLE(h), 1))
     finally:
         k32.CloseHandle(h)
@@ -152,17 +192,19 @@ class Watch(threading.Thread):
 
     止めるのは、見張りが子孫として見た PID のうち、実行ファイル名と作成時刻が、見たときと今とで同じものだけ
     (PID が別のプロセスに再利用されていたら止めない。PR #7 のレビュー 1 回目の推奨 1)。
-    snap・ctime_of・kill は、テストで差し替えるための口。
+    snap・ctime_of・kill_if_same (pid, 見たときの作成時刻 → 止めたか)・clock は、テストで差し替えるための口。
     """
 
-    def __init__(self, root_pids: list[int], interval: float = 0.25, *, snap=None, ctime_of=None, kill=None):
+    def __init__(self, root_pids: list[int], interval: float = 0.25, *, snap=None, ctime_of=None,
+                 kill_if_same=None, clock=None):
         super().__init__(daemon=True)
         self.root_pids = root_pids
         self.root_ctime: int | None = None
         self.interval = interval
         self.snap = snap or snapshot
         self.ctime_of = ctime_of or process_create_time
-        self.kill = kill or terminate
+        self.kill_if_same = kill_if_same or terminate_if_same
+        self.clock = clock or now_filetime
         self.seen: dict[int, tuple[str, int]] = {}
         self.max_alive = 0
         self.stop_flag = threading.Event()
@@ -175,9 +217,10 @@ class Watch(threading.Thread):
             return {}
         if self.root_ctime is None:
             self.root_ctime = self.ctime_of(self.root_pids[0])
+        before = self.clock()  # スナップショットの直前の時刻 (verified_descendants の before)
         procs = self.snap()
         alive = {pid: exe for pid, _pp, exe in procs}
-        found = verified_descendants(procs, self.root_pids[0], self.root_ctime, self.ctime_of)
+        found = verified_descendants(procs, self.root_pids[0], self.root_ctime, self.ctime_of, before)
         # 親が先に消えた子孫: 見たときと同じ PID・同じ名前・同じ作成時刻で生きているものだけ
         for pid, (exe, ct) in self.seen.items():
             if pid not in found and alive.get(pid) == exe and self.ctime_of(pid) == ct:
@@ -185,10 +228,13 @@ class Watch(threading.Thread):
         return found
 
     def kill_verified(self, targets: dict[int, tuple[str, int]]) -> dict[int, tuple[str, int]]:
-        """止める直前にもう一度、作成時刻が同じことを確かめてから止める。"""
+        """見たときの作成時刻のまま止める。確かめと止める操作は kill_if_same の中で同じハンドルで行う。
+
+        止める直前に作成時刻を読み直して渡さない (読み直すと、PID が回った後の別のプロセスと一致してしまう)。
+        """
         done = {}
         for pid, (exe, ct) in targets.items():
-            if self.ctime_of(pid) == ct and self.kill(pid):
+            if self.kill_if_same(pid, ct):
                 done[pid] = (exe, ct)
         return done
 
@@ -225,10 +271,13 @@ def _names(d: dict) -> dict[str, int]:
     return out
 
 
-def timed_call(fn, timeout: float, grace: float) -> dict:
-    """fn() (中で subprocess.run(timeout=...) を 1 回呼ぶもの) を測る。"""
+def timed_call(fn, timeout: float, grace: float, *, make_watch=None) -> dict:
+    """fn() (中で subprocess.run(timeout=...) を 1 回呼ぶもの) を測る。
+
+    make_watch(root_pids) -> Watch は、テストで見張りを差し替えるための口 (省略すると本物の Watch)。
+    """
     root_pids: list[int] = []
-    watch = Watch(root_pids)
+    watch = (make_watch or Watch)(root_pids)
 
     def on_start(pid: int) -> None:
         # 子が起きた直後に作成時刻を取る (子孫の確かめの起点)
@@ -280,7 +329,10 @@ time.sleep(sleep)
 
 
 def stand_in(mode: str, timeout: float, sleep: float) -> dict:
-    """_call_claude と同じ形 (stdin・stdout はファイル、stderr=PIPE) で、代わりの子を呼ぶ。"""
+    """0.4.0 までのキットの _call_claude と同じ形 (stdin・stdout はファイル、stderr=PIPE) で、代わりの子を呼ぶ。
+
+    0.5.0 からキットは stderr も一時ファイルに書く (#2)。ここは待ちの仕組みを見るために pipe のまま。
+    """
     with tempfile.TemporaryDirectory() as d:
         fin_p, fout_p = Path(d) / "in.txt", Path(d) / "out.txt"
         fin_p.write_text("x", encoding="utf-8")
@@ -312,7 +364,9 @@ def claude(timeout: float, chars: int, seed: int, model: str, grace: float) -> d
         return real_run(cmd, *a, **k)
 
     def call():
-        # キットの経路そのまま (proofread_body → _call_claude)。替えるのは timeout だけ
+        # キットの経路そのまま (proofread_body → _call_claude_json)。替えるのは timeout だけ。
+        # 0.5.0 から 3,000 字を超える本文は分けて校閲するので、時間切れになるのは最初のまとまりの呼び出し
+        # (時間切れはやり直さず、残りのまとまりは呼ばない。見張る root も最初の呼び出しの子)
         with mock.patch.object(proofread.subprocess, "run", run_with_timeout):
             proofread.proofread_body(body, names, model=model)
 

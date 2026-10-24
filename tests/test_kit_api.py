@@ -15,7 +15,6 @@ import contextlib
 import inspect
 import io
 import json
-import subprocess
 import sys
 import tempfile
 import types
@@ -25,7 +24,9 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT / "tests"))
 
+import _import_guard  # noqa: E402
 import engine  # noqa: E402
 import glossary  # noqa: E402
 import transcribe  # noqa: E402
@@ -153,28 +154,10 @@ class CallStyleTest(unittest.TestCase):
 
 
 class ImportSideEffectTest(unittest.TestCase):
+    # 塞ぐもの (プロセスの起動・ソケット・ctypes の DLL の読み込み) と重いモジュールの一覧は
+    # tests/_import_guard.py の 1 か所 (#12。tests/test_measure.py と同じ前置きを使う)
     def test_import_transcribe_is_light(self):
-        code = (
-            "import sys, os, subprocess, socket, ctypes\n"
-            "class Boom:\n"
-            "    def __init__(self, *a, **k): raise AssertionError('side effect on import')\n"
-            "class BoomLoader:\n"
-            "    def __getattr__(self, name): raise AssertionError('side effect on import')\n"
-            "def boom(*a, **k): raise AssertionError('side effect on import')\n"
-            "subprocess.Popen = Boom; socket.socket = Boom; socket.create_connection = boom\n"
-            "for n in dir(os):\n"
-            "    if n.startswith(('spawn', 'exec')) or n in ('system', 'startfile', 'popen'):\n"
-            "        setattr(os, n, boom)\n"
-            "ctypes.CDLL = Boom; ctypes.WinDLL = Boom\n"
-            "ctypes.cdll = ctypes.windll = BoomLoader()\n"
-            f"sys.path.insert(0, {str(ROOT / 'scripts')!r})\n"
-            "import transcribe, glossary, engine, proofread\n"
-            "heavy = ['torch', 'whisperx', 'faster_whisper', 'ctranslate2', 'tokenizers', 'huggingface_hub', 'numpy',\n"
-            "         'pyannote']\n"
-            "print('loaded:' + ','.join(m for m in heavy if m in sys.modules))\n"
-        )
-        cp = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, encoding="utf-8",
-                            timeout=120)
+        cp = _import_guard.import_in_child(ROOT / "scripts", ["transcribe", "glossary", "engine", "proofread"])
         self.assertEqual(cp.returncode, 0, cp.stderr)
         self.assertEqual(cp.stdout.strip(), "loaded:")
 

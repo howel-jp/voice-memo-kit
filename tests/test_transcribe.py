@@ -720,6 +720,30 @@ class PromptDocsTest(unittest.TestCase):
             self.assertIn("`印の語のうち N 語は入りません`", doc)
             self.assertNotIn("語も入りません", doc)
 
+    def test_one_letter_is_not_used_for_two_numbers(self):
+        # #12 (PR #11 のレビュー 3 回目の任意 1): N は「入らなかった印の語の数」だけに使う (テストで固定している文の字)。
+        # 届く語の数は H、辞書の語の数は M と書く
+        self.assertIn("`[A] initial_prompt … 届く H/M 語、届かない K 語`", self.skill)
+        self.assertIn("`届く 0/M 語`", self.readme)
+        for name, doc in (("SKILL.md", self.skill), ("README.md", self.readme)):
+            with self.subTest(doc=name):
+                self.assertNotRegex(doc, r"届く N/")
+                self.assertNotRegex(doc, r"/N 語")
+
+    def test_skill_md_tells_the_user_about_the_chunk_warn(self):
+        # #12 (見張っていること: 1 チャンクの出力の頭打ち): SKILL.md §5 は、この [WARN] を利用者に 1 行で伝える。
+        # 書き出しと、数を取る括弧の形を、コードの出す行と結ぶ
+        prefix = "[WARN] 1 チャンクの出力が"
+        warn = [ln.strip() for ln in t.chunk_log_lines([{"text": "合" * 201}, {"text": "成"}], char_encoder, 0)
+                if "[WARN]" in ln]
+        self.assertEqual(len(warn), 1)
+        self.assertTrue(warn[0].startswith(prefix), warn[0])
+        self.assertIn("（1 チャンク、最大 201）", warn[0])
+        item = self.skill[self.skill.index(f"- `{prefix}` で始まる行"):]
+        item = item[: item.index("\n## ")]
+        self.assertIn("1 行で伝える", item)
+        self.assertIn("`（n チャンク、最大 m）`", item)
+
     def test_skill_md_separates_the_two_kinds_of_prompt_warn(self):
         # PR #11 のレビュー 1 回目の推奨 1: SKILL.md §5 は 2 種類の [WARN] initial_prompt を分けて読む。
         # コードの出す [WARN] initial_prompt の行が、どちらかの書き出しで始まることを結ぶ
