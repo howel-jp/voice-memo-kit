@@ -14,6 +14,7 @@ description: 音声ファイル（ボイスメモ）をローカル WhisperX で
 
 **スコープ**: 対象音声の決定 → 文字起こし実行 → transcript 読込 → 内容の理解確認 → そこから会話/作業の開始。
 voice_memos の中身はローカル限定（git 管理外が原則）なので、本 Skill は記録・commit を目的としない。
+出力の置き場が別のフォルダ（`output_root`。例: 文字起こしを入れておく別の repo）のときも、md を動かす・名前を変える・commit することはしない（そのフォルダの決まりに任せる）。
 
 ## 0. 前提（2 層構造）
 
@@ -22,7 +23,10 @@ voice_memos の中身はローカル限定（git 管理外が原則）なので�
 | プロジェクト層 | カレントディレクトリ直下 `voice_memos/` | `inbox/`（このプロジェクト向けの音声）、`transcripts/`（出力先）、`processed/`、`glossary/`（プロジェクト固有の辞書）、`config.json`（任意の設定上書き） |
 | グローバル層 | `~/voice_memos/` | `inbox/`（どのプロジェクトにも属さない音声）、`processed/`、`glossary/`（PC 共通の辞書） |
 
-- 音声は **プロジェクト inbox → グローバル inbox の順に両方**処理される（プロジェクト優先）。transcript は常にプロジェクト層の `transcripts/` に出る
+- 音声は **プロジェクト inbox → グローバル inbox の順に両方**処理される（プロジェクト優先）。transcript はプロジェクト層の置き場に出る
+- 出力の置き場（transcript とプロジェクト層の `processed/`）は、`voice_memos/config.json` の `output_root` で別のフォルダにできる。
+  候補のうち、この PC にある最初のフォルダの下に出す。どれも無い PC では、根を作らずに既定の置き場（`voice_memos/transcripts/`・`processed/`）に出す。
+  どこに出るかは決め打ちで見ず、ランチャーの出力の `transcripts=`・`processed  =` の行と、各ファイルの `->` の行で知る（§1・§3）
 - 辞書はグローバル → `extra_glossary_dirs`（`voice_memos/config.json` で明示追加したプロジェクト共有辞書、任意）→ プロジェクト `voice_memos/glossary/` の順に**マージ**（同じ canonical は後の層＝プロジェクトが優先）
 - 辞書の語は initial_prompt で Whisper に予告するが、Whisper が使うのは後ろ 223 トークン（語およそ 25 語）まで。収まらないとき、辞書の項目に `"priority": true` の印がある語を優先して届ける（README「initial_prompt の長さと、届ける語の優先」）
 - `--no-global` でグローバル層を無視できる
@@ -32,13 +36,17 @@ voice_memos の中身はローカル限定（git 管理外が原則）なので�
 - **引数あり**（音声ファイル/フォルダのパス）: それを対象にする。
 - **引数なし**: プロジェクト `voice_memos/inbox/` とグローバル `~/voice_memos/inbox/` の音声すべてを対象にする。
 
-実行前に両 inbox の中身を確認（処理対象の把握 + 後で新規 transcript を特定するため）:
+実行前に、ランチャーの `--list` で対象と置き場を確かめる（処理対象の把握 + 後で新規 transcript を特定するため）。
+`--list` は対象の音声と置き場を出すだけで、文字起こし・音声の移動・フォルダの作成をしない（ランチャーとパス変数は §2 と同じ）:
 
 ```powershell
-Get-ChildItem voice_memos\inbox, "$env:USERPROFILE\voice_memos\inbox" -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in '.mp3','.m4a','.wav','.aac','.flac','.ogg','.mp4' } | Select-Object Directory, Name
+& "${CLAUDE_PLUGIN_ROOT}\transcribe.ps1" -DataDir "${CLAUDE_PLUGIN_DATA}" --list | Out-String
 ```
 
-対象が無ければ「`voice_memos/inbox/`（プロジェクト）または `~/voice_memos/inbox/`（共通）に音声を置いてください（または音声パスを指定）」と案内して終了。
+- 出力の `transcripts=` の行が md の出る置き場、`processed  =` の行がプロジェクト層の音声の退避先。続く行が対象の音声、最後の行が `対象 N 件`
+- 対象が 0 件なら「`voice_memos/inbox/`（プロジェクト）または `~/voice_memos/inbox/`（共通）に音声を置いてください（または音声パスを指定）」と案内して終了
+- `[WARN] 置き場の根` の行があれば、§2 の同じ行の扱い
+- ランチャーが exit 2（`Python venv not found`）を返したら、§2 の「初回セットアップ」へ
 
 ## 2. 文字起こし＋校閲を実行
 
@@ -54,7 +62,10 @@ Get-ChildItem voice_memos\inbox, "$env:USERPROFILE\voice_memos\inbox" -File -Err
 & "${CLAUDE_PLUGIN_ROOT}\transcribe.ps1" -DataDir "${CLAUDE_PLUGIN_DATA}" "<音声パス>" | Out-String
 ```
 
-- 出力は `voice_memos/transcripts/<録音日>_<元ファイル名>.md`、音声は見つかった層の `processed/` へ自動退避。
+- 出力は、ランチャーの出力の `transcripts=` の行のフォルダに `<録音日>_<元ファイル名>.md`（既定は `voice_memos/transcripts/`）。
+  各ファイルの `->` の行が、その md のパス。音声は見つかった層の退避先（プロジェクト層は `processed  =` の行）へ自動退避。
+- `[WARN] 置き場の根（output_root.candidates）が、この PC にどれもありません。根は作らずに、既定の置き場に出します` の行が出たら、
+  md が設定の置き場ではなく既定の置き場に出たことを、利用者に 1 行で伝える（例:「設定の置き場がこの PC に無いので、既定の voice_memos/transcripts/ に出しました」）。
 - **注意**: `2>&1 | Select-String` 等で stderr を混ぜると、ライブラリ警告が終了エラー扱いされ途中中断する
   ことがある。**素直にそのまま実行**するか、出力を `| Out-String` で受ける。成否は終了コードと transcript 生成有無で判断する。
 - 前面で実行するときは、道具の timeout を明示する（Claude Code の Bash / PowerShell の道具は、既定 2 分・最大 10 分 = 600000 ms）。
@@ -63,7 +74,7 @@ Get-ChildItem voice_memos\inbox, "$env:USERPROFILE\voice_memos\inbox" -File -Err
   10 分を超えそうなら、上のコマンドを Bash / PowerShell の道具の `run_in_background` で実行し、道具の終わりの通知
   （ランチャーの終了コードと出力）を待ってから §3 へ進む。通知の前に終わりを確かめるなら、ランチャーの出力の最後の行
   `完了: m/n 件`（n は対象の数、m は md を書けた数。m が n より小さければ失敗したものがあり、全部失敗なら終了コード 1）か、
-  `voice_memos/transcripts/` に今回の md が対象の数だけできたことを見る。`Start-Job`・`Start-Process` などで切り離さない
+  `transcripts=` の行のフォルダに今回の md が対象の数だけできたことを見る。`Start-Job`・`Start-Process` などで切り離さない
   （出力と終了コードを見失う）。
 - 文字起こし自体が失敗した場合（GPU 不調等）は `--device cpu` を案内、またはユーザーに状況を伝える。
   GPU の無い PC で常用するなら `voice_memos/config.json` に `{"whisper": {"device": "cpu"}}` を書く
@@ -87,10 +98,14 @@ Get-ChildItem voice_memos\inbox, "$env:USERPROFILE\voice_memos\inbox" -File -Err
 
 ## 3. 生成された transcript を読む
 
-実行後、`voice_memos/transcripts/` で**今回生成された md**（更新時刻が最新のもの／§1 で把握した対象に対応するもの）を Read で読む。複数あれば全部。
+実行後、ランチャーの出力の `->` の行に出た**今回生成された md**（§1 で把握した対象に対応するもの）を Read で読む。複数あれば全部。
 
 各 md の構成:
-- frontmatter（`date / source / duration / engine / segments / glossary_replacements / proofread`。校閲に失敗したときだけ、続けて `proofread_error / proofread_error_detail`）
+- frontmatter（`date / recorded_at / source / duration / engine / segments / glossary_replacements / proofread`。校閲に失敗したときだけ、続けて `proofread_error / proofread_error_detail`。
+  話題を入れる設定のときは、続けて `topic`、付けられなかったときは `topic_error / topic_error_detail`）
+  - `recorded_at`: 録音の時刻（音声のファイルの更新時刻。時差つき）。`date` はその日付
+  - `topic`: 何の話かの 1 行（Claude が校閲後の本文から付けた。JSON の文字列の形）。メモを探す手がかり。本文の代わりにしない
+  - `topic_error`: 話題を付けようとして付けられなかった理由（`proofread_error` と同じ語）。文字起こし・校閲には効かない
   - `proofread`: 本文が Claude で校閲された文ならモデル名。`false` なら本文は校閲されていない（校閲しない設定、文字起こしが空、または校閲に失敗）。
     長い文字起こし（3,000 字を超えるもの）は分けて校閲してつなぐが、モデル名なら本文の全部が校閲後で、一部でも校閲できなければ `false`
   - `proofread_error`: 校閲を試みたが結果を使わなかった理由。`timeout`（時間切れ）/ `cli_error`（Claude CLI のエラー）/ `empty`（空の結果）/ `too_short`（短すぎる＝要約の疑い）/ `incomplete`（一部が欠けた疑い）/ `error`（その他）。`proofread_error_detail` は数などの補足 1 行。

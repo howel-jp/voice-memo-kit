@@ -12,6 +12,11 @@
     "processed": "processed",
     "glossary": "glossary"
   },
+  "output_root": {
+    "candidates": [],
+    "transcripts": "transcripts",
+    "processed": "processed"
+  },
   "whisper": {
     "model": "large-v3",
     "compute_type": "int8",
@@ -26,5 +31,10 @@
   "proofread": {
     "enabled": true,
     "model": "claude-sonnet-4-6"
+  },
+  "topic": {
+    "enabled": false,
+    "model": null,
+    "max_chars": 30
   }
 }

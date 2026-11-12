@@ -242,7 +242,8 @@ class _ProcessOneBase(unittest.TestCase):
     ]
     RAW = "えーと、今日はぞるまの件です。次に進めます。\n\n最後にぞるまを確かめます。"
     REPLACED = "えーと、今日はゾルマの件です。次に進めます。\n\n最後にゾルマを確かめます。"
-    KEYS = ["date", "source", "duration", "engine", "segments", "glossary_replacements", "proofread"]
+    # 0.7.0 (#14) で date の次に recorded_at を足した (8 キー)。話題 (topic) は既定では付かない
+    KEYS = ["date", "recorded_at", "source", "duration", "engine", "segments", "glossary_replacements", "proofread"]
     ERROR_KEYS = KEYS + ["proofread_error", "proofread_error_detail"]
 
     def setUp(self):
@@ -344,7 +345,7 @@ class ProcessOneTest(_ProcessOneBase):
     def test_success_keeps_pre_proofread_and_pre_replacement(self):
         self._cli(lambda b: b.replace("えーと、", ""))
         r = self._run()
-        self.assertEqual(r["keys"], self.KEYS)  # 今の 7 キーが同じ順。足すキーは付かない
+        self.assertEqual(r["keys"], self.KEYS)  # 今の 8 キーが同じ順。足すキーは付かない
         self.assertEqual((r["fm"]["proofread"], r["fm"]["glossary_replacements"]), (self.model, "2"))
         self.assertEqual(r["body"], self.REPLACED.replace("えーと、", ""))
         self.assertEqual(r["summaries"], [t.PRE_PROOFREAD_SUMMARY, t.PRE_REPLACEMENT_SUMMARY])
@@ -486,7 +487,7 @@ class ProcessOneChunkedTest(_ProcessOneBase):
         r = self._run_long()
         self.assertEqual(self.cli_bodies, [c.text for c in self.chunks])
         self.assertTrue(all(len(b) <= proofread.CHUNK_CHARS for b in self.cli_bodies))
-        self.assertEqual(r["keys"], self.KEYS)  # 今の 7 キーが同じ順。足すキーは付かない
+        self.assertEqual(r["keys"], self.KEYS)  # 今の 8 キーが同じ順。足すキーは付かない
         self.assertEqual((r["fm"]["proofread"], r["fm"]["glossary_replacements"]), (self.model, "100"))
         self.assertEqual(r["body"], self.replaced.replace("えーと、", ""))  # つないだ校閲後
         self.assertEqual(proofread.count_paragraphs(r["body"]), 100)  # 入力の段落が欠けずに残る
