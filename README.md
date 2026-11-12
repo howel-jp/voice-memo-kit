@@ -99,8 +99,8 @@ Claude が `setup.ps1` の実行を案内する。手動で行う場合:
 {
   "output_root": {
     "candidates": ["${MY_NOTES_DIR}", "D:/notes-repo"],
-    "transcripts": "voice_memos/inbox",
-    "processed": "attachments/voice_memos"
+    "transcripts": "transcripts",
+    "processed": "audio"
   }
 }
 ```
