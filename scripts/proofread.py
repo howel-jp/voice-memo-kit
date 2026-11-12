@@ -92,13 +92,14 @@ def load_system_prompt() -> str:
     return path.read_text(encoding="utf-8")
 
 
-def _call_claude_json(system_prompt: str, user_message: str, model: str) -> dict:
+def _call_claude_json(system_prompt: str, user_message: str, model: str, timeout: float = 900) -> dict:
     """Claude Code CLI を呼んで、CLI の JSON（result・num_turns など）を返す。
 
     Windows の PIPE 詰まり回避のため stdin/stdout/stderr を tempfile 経由にする
     （02b_proofread.py と同じ手法）。ANTHROPIC_API_KEY は除去して Max を強制。
     stderr も pipe にしない: Python 3.10 の Windows の subprocess.run は、時間切れで子を止めた後、
     pipe が閉じるまで timeout なしで待つので、孫が pipe を持っていると返らない（#4 の U5）。
+    timeout は 1 回の呼び出しの秒（校閲は 900。話題は TOPIC_TIMEOUT_SEC）。
     """
     bin_path = find_claude_bin()
     env = os.environ.copy()
@@ -139,7 +140,7 @@ def _call_claude_json(system_prompt: str, user_message: str, model: str) -> dict
              open(stderr_path, "w", encoding="utf-8") as ferr:
             cp = subprocess.run(
                 cmd, stdin=fin, stdout=fout, stderr=ferr,
-                text=True, encoding="utf-8", env=env, timeout=900,
+                text=True, encoding="utf-8", env=env, timeout=timeout,
             )
         if cp.returncode != 0:
             err = stderr_path.read_text(encoding="utf-8", errors="replace")
@@ -549,8 +550,106 @@ def proofread_body(
     return _join(chunks, outputs)
 
 
+# --- 話題 (#14) ---------------------------------------------------------------
+
+# 話題の長さの上限（字。コードポイント）。config の topic.max_chars で変えられる
+TOPIC_MAX_CHARS = 30
+# 話題を決めるのに渡す本文の上限（字）。長いメモは頭から渡す（45 分のメモで約 12,600 字。#4 の U4）
+TOPIC_INPUT_MAX_CHARS = 20000
+# 話題の 1 回の呼び出しの時間切れ（秒）。出力は 1 行なので、校閲 (900) より短くする
+TOPIC_TIMEOUT_SEC = 300
+
+# 返しの頭に付きがちなラベル（「話題：」「**話題:**」「**話題**：」「Topic:」など）と、行の頭の Markdown の印。
+# ラベルの前に開いた強調の印（** か __）があるときだけ、それを閉じる印を食べる（ラベルの語の直後か、コロンの直後の 1 つ）。
+# 前に開いた印が無いときは、コロンの後ろの印を食べない（「話題: **値**」の値の対を残し、後で対として外す。PR #15 のレビュー 2 回目）
+_TOPIC_LABEL_WORDS = r"(?:話題|トピック|題名|タイトル|topic|title)"
+_TOPIC_LABEL_RE = re.compile(rf"^(\*\*|__)?{_TOPIC_LABEL_WORDS}(?:\1\s*[:：]|\s*[:：]\s*(?:\1)?)\s*", re.IGNORECASE)
+# ラベルの語だけの行（「## 話題」「話題：」「**話題**」）。その行は飛ばし、次の空でない行を話題にする
+_TOPIC_LABEL_ONLY_RE = re.compile(rf"^(?:\*\*|__)?{_TOPIC_LABEL_WORDS}(?:\*\*|__)?\s*[:：]?\s*(?:\*\*|__)?$", re.IGNORECASE)
+_TOPIC_MARK_RE = re.compile(r"^(?:#+|[->・]|\d+[.)])\s+")
+# 外側の括弧・引用符・強調（対になっているときだけ外す。長いものから）
+_TOPIC_PAIRS = (("**", "**"), ("__", "__"), ("「", "」"), ("『", "』"), ("【", "】"), ("（", "）"), ("(", ")"),
+                ("[", "]"), ('"', '"'), ("'", "'"), ("“", "”"), ("‘", "’"), ("`", "`"), ("*", "*"))
+
+
+class TopicEmpty(ProofreadRejected):
+    """話題の結果が、ラベル・括弧・空白を除くと空。"""
+
+    reason = "empty"
+
+
+def load_topic_prompt() -> str:
+    path = PROMPTS_DIR / "memo_topic.md"
+    if not path.exists():
+        raise FileNotFoundError(f"話題のプロンプトが見つかりません: {path}")
+    return path.read_text(encoding="utf-8")
+
+
+def _topic_message(text: str, max_chars: int) -> str:
+    return (
+        "以下はボイスメモの文字起こしです。システムプロンプトの決まりに従って、"
+        f"何の話かを {max_chars} 字までの 1 行で返してください。**話題の 1 行のみ**を返してください。\n\n"
+        "【文字起こし本文】\n"
+        f"{text}"
+    )
+
+
+def clean_topic(raw: str, max_chars: int = TOPIC_MAX_CHARS) -> str:
+    """Claude の返しを、話題の 1 行にする。
+
+    最初の空でない行だけを使う（コードフェンスの行と、ラベルの語だけの行は飛ばす）。頭のラベル（「話題：」など）・
+    Markdown の印・外側の括弧と引用符を外し、空白の並び（全角の空白・改行の類も）を 1 つの空白にし、
+    印字できない字（制御文字・幅の無い字・向きの字など。YAML が読めない字を含む）を落として、
+    max_chars 字（コードポイント）で切る。ファイル名に使えるかどうかは、使う側（名前を付ける道具）が決める。
+    """
+    lines = [ln.strip() for ln in _normalize_newlines(raw).split("\n")]
+    t = next((ln for ln in lines if ln and not ln.startswith("```")
+              and not _TOPIC_LABEL_ONLY_RE.match(_TOPIC_MARK_RE.sub("", ln).strip())), "")
+    for _ in range(5):  # 印・括弧・ラベルが重なっていても外す
+        before = t
+        t = _TOPIC_MARK_RE.sub("", t).strip()
+        # 行の全体を囲む対（「**話題：値**」の ** など）は、ラベルより先に外す
+        for o, c in _TOPIC_PAIRS:
+            inner = t[len(o): len(t) - len(c)]
+            # 外側の 1 対が全体を囲むときだけ（「A」と「B」のように中にも同じ括弧があるものは外さない）。
+            # 中が空の対（「」だけの返し）も外す（空として扱う）
+            if len(t) >= len(o) + len(c) and t.startswith(o) and t.endswith(c) and o not in inner and c not in inner:
+                t = inner.strip()
+                break
+        t = _TOPIC_LABEL_RE.sub("", t).strip()
+        if t == before:
+            break
+    t = " ".join(t.split())
+    # 空白をそろえた後に、印字できない字を落とす（全角の空白は先に空白にしてあるので落ちない）
+    t = " ".join("".join(ch for ch in t if ch.isprintable()).split())
+    return t[: max(1, int(max_chars))].strip()
+
+
+def make_topic(
+    text: str,
+    *,
+    model: str = "claude-sonnet-4-6",
+    max_chars: int = TOPIC_MAX_CHARS,
+    timeout: float = TOPIC_TIMEOUT_SEC,
+) -> str:
+    """文字起こしを Claude に読ませ、何の話かを 1 行（max_chars 字まで）で返す。
+
+    渡すのは本文の頭の TOPIC_INPUT_MAX_CHARS 字まで。結果が空なら TopicEmpty。
+    CLI の失敗・時間切れは、校閲と同じ例外のまま送出する（理由は describe_failure で読む）。
+    呼び出し側は例外を捕捉し、話題なしで保存する（文字起こしは失わない）。
+    """
+    if not text.strip():
+        raise TopicEmpty("文字起こしが空なので、話題を付けません", detail="空の文字起こし")
+    data = _call_claude_json(load_topic_prompt(), _topic_message(text[:TOPIC_INPUT_MAX_CHARS], max_chars),
+                             model, timeout=timeout)
+    topic = clean_topic(str(data.get("result") or ""), max_chars)
+    if not topic:
+        raise TopicEmpty("話題の結果が空です", detail="空の結果")
+    return topic
+
+
 def describe_failure(exc: BaseException) -> tuple[str, str]:
-    """校閲の失敗を、md に書く (理由の語, 1 行の補足) にする。
+    """校閲（と話題）の失敗を、md に書く (理由の語, 1 行の補足) にする。
 
     理由の語: timeout / cli_error / empty / too_short / incomplete / error。
     補足は数と理由の語だけ（本文・辞書の語・CLI の stderr・例外の文は入れない）。

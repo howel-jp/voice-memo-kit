@@ -15,7 +15,8 @@
 | 何を確かめるか | どこで見るか | いつ | 書く先 |
 |---|---|---|---|
 | 45 分級の実際のメモが校閲されるか。置き換えがあれば、置き換え前の語が残るか | 出力 md の frontmatter の `proofread` がモデル名か。`<details>` の「置き換え前（Whisper の出力）」の節（置き換えが 1 箇所以上のとき） | 次に 45 分級のメモを録ったとき（持ち主） | #3 にコメント（数と「残った / 残らなかった」だけ） |
-| 長いメモを `/voice-memo` で走らせたとき、Claude が前面の timeout で止められずに md まで進むか | SKILL.md §2 の `run_in_background` の手順どおりに進んだか。`voice_memos/transcripts/` に md ができたか | 同上 | 同上 |
+| 長いメモを `/voice-memo` で走らせたとき、Claude が前面の timeout で止められずに md まで進むか | SKILL.md §2 の `run_in_background` の手順どおりに進んだか。ランチャーの `transcripts=` の行のフォルダに md ができたか | 同上 | 同上 |
+| 話題（`topic`）を入れたとき、実のメモで 1 行の話題が付くか。長さと形（名詞句・ラベルや括弧なし）が `prompts/memo_topic.md` の決まりどおりか。`output_root` の根がある PC と無い PC で、md の置き場が `transcripts=` の行と合うか | 出力 md の frontmatter の `topic`・`topic_error`、ランチャーの `transcripts=` の行 | 話題を入れて最初のメモを録ったとき（持ち主） | #14 にコメント（付いた数・付かなかった数と理由の語・字数だけ。話題の文は書かない） |
 | 実のメモで `proofread_error: incomplete` が出たとき、誤検知か本当の欠けか | `proofread_error_detail`（段落の数・`num_turns`・末尾）と、校閲前の文の突き合わせ | 出たとき | 振り分けへ（下の注）。材料は detail の値と、誤検知か欠けかだけ |
 | `[WARN] initial_prompt` が出たときに Claude が 1 行で伝えるか。`"priority": true` を付けて誤変換が減るか | ランチャーの出力と Claude の返事。印を付ける前後の誤変換の回数 | 辞書が 223 トークンを超えたとき | 同上（印の効き目は測っていない） |
 | キットを更新した後に、meeting-transcript・clip-shorts が動くか | 2 つのスキルを 1 回ずつ動かす（どちらもキットの 7 関数を import する） | キットの version を上げた後 | 同上（`tests/test_kit_api.py` が確かめるのは呼び方と型だけ） |

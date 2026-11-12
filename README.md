@@ -7,7 +7,8 @@
 - 文字起こし: WhisperX `large-v3`（INT8 / CUDA）。単語整列は省略して高速化
 - 固有名詞補正: プロジェクト別の辞書（JSON）で initial_prompt 予告＋誤認識置換の二段補正
 - 校閲: Claude Code CLI（サブスクリプション容量内・追加課金なし）。校閲前の文と、辞書の置き換え前の文（置き換えがあったとき）も md 内に保持
-- 出力: `<project>/voice_memos/transcripts/<録音日>_<元ファイル名>.md`
+- 出力: `<project>/voice_memos/transcripts/<録音日>_<元ファイル名>.md`（`output_root` で、PC にあるときだけ別のフォルダにできる）
+- 任意: 何の話かの 1 行（`topic`）を Claude が付けて frontmatter に書く（既定は切）
 
 📝 紹介記事（入れ方・使い方を順に説明）: [ボイスメモをそのままClaude Codeの指示にするスキル｜note](https://note.com/trinity_nexus/n/n7ac7edfae794)
 
@@ -69,8 +70,8 @@ Claude が `setup.ps1` の実行を案内する。手動で行う場合:
 ```
 <project>/voice_memos/          # プロジェクト層（カレントディレクトリ直下）
 ├── inbox/        # このプロジェクト向けの音声（git 管理外）
-├── transcripts/  # 出力先。グローバル層の音声の transcript もここに出る（git 管理外）
-├── processed/    # 処理済み音声の退避先（git 管理外）
+├── transcripts/  # 出力先。グローバル層の音声の transcript もここに出る（git 管理外。output_root があればその根の下）
+├── processed/    # 処理済み音声の退避先（git 管理外。output_root があればその根の下）
 ├── glossary/     # 任意: プロジェクト固有の辞書 *.json（共有してよい）
 └── config.json   # 任意: 既定設定の上書き
 
@@ -88,6 +89,47 @@ Claude が `setup.ps1` の実行を案内する。手動で行う場合:
   ```
   `voice_memos/config.json` に書く。パスはプロジェクトルート基準（絶対パスも可）。既定の `voice_memos/glossary/` は常に有効で、ここに列挙した辞書が**追加**される
 - `config.json` は `config.default.json` と同じキーの部分上書き（例: `{"global_root": "D:/memos"}`）
+
+### 出力の置き場を別のフォルダにする（output_root）
+
+文字起こしを、プロジェクトの外のフォルダ（例: 文字起こしを入れておく別の repo）に出したいときに使う。
+`config.json` をチームで共有していても、そのフォルダを持たない PC では今までどおりの置き場に出る。
+
+```json
+{
+  "output_root": {
+    "candidates": ["${MY_NOTES_DIR}", "D:/notes-repo"],
+    "transcripts": "transcripts",
+    "processed": "audio"
+  }
+}
+```
+
+- `candidates`（根の候補）のうち、**この PC にある最初のフォルダ**を根にする。transcript は `<根>/<transcripts>`、プロジェクト層の音声の退避先は `<根>/<processed>` になる（根の下のフォルダは作る）
+- 候補には環境変数（`$VAR`・`${VAR}`・Windows の `%VAR%`）と `~` を書ける。展開できない環境変数が残る候補と、無いフォルダの候補は飛ばす。相対パスはプロジェクトルート基準
+- どの候補も無い PC では、**根を作らずに**既定の置き場（`paths.transcripts`・`paths.processed`）に出し、次の行を出す:
+  ```
+    [WARN] 置き場の根（output_root.candidates）が、この PC にどれもありません。根は作らずに、既定の置き場に出します
+  ```
+  `--out-dir` を渡したときは、md はそこに出るので、行の後半が `根は作らずに、音声の退避先は既定の置き場にします（md は --out-dir に出します）` になる
+- `transcripts`・`processed` は根の下の相対パス（空・絶対パス・`..` は設定の誤りとして止める）
+- 変わらないもの: 音声の受け箱（`paths.inbox`）、辞書、グローバル層（`~/voice_memos/processed/` に退避する音声は今までどおり）。`--out-dir` を渡せば、それが transcript の置き場になる
+- md は `.` で始まる一時ファイル（`.<名前>.tmp`）に書いてから名前を変える。ほかの道具が、書きかけの md を読まない。書けなかったとき（容量・権限など）は、一時ファイルを消してから止まる
+- どこに出るかは、ランチャーの出力の `transcripts=`・`processed  =` の行で分かる（`=` の後ろはパスだけ）。根を使うときだけ、続けて `output_root=<根>` の行が出る。`--list` は、対象の音声と置き場を出すだけで何もしない
+- 参照する環境変数のどれかが空の候補も飛ばす（`${EMPTY}/sub` がドライブの根の下を指さないように）
+
+### frontmatter の録音の時刻と話題（recorded_at・topic）
+
+- `recorded_at`: 録音の時刻（音声のファイルの更新時刻。時差つきの ISO 8601。例 `2026-01-02T03:04:05+09:00`）。`date` はその日付で、ファイル名の `<録音日>` と同じ
+- `source`: 元の音声の名前。0.7.0 から JSON の文字列の形（`source: "memo.m4a"`）で書く（0.6.1 までは引用符なし）。名前の `#`・`[`・`&` などで、YAML として読む道具が読み違えないため
+- `topic`（任意。既定は切）: 校閲の後に Claude を 1 回呼び、何の話かを 1 行（既定 30 字まで）にして、JSON の文字列の形で書く。校閲しないときは文字起こしから付ける。
+  返しは 1 行にそろえる（ラベル・Markdown の印・全体を囲む括弧を外し、空白をそろえ、印字できない字を落とす）。
+  付けられなかったとき（時間切れ・CLI のエラー・空の結果）は、`topic` を書かずに `topic_error`・`topic_error_detail` を書く（文字起こしは失わない）。
+  プロンプトは `prompts/memo_topic.md`。入れるときは `config.json` に:
+  ```json
+  { "topic": { "enabled": true, "max_chars": 30 } }
+  ```
+  `"model"` を書かなければ、校閲と同じモデル。1 回だけ付けないときは `--no-topic`。本文は頭から 20,000 字までを渡す
 
 辞書 JSON の書式:
 
@@ -145,7 +187,8 @@ Whisper（faster-whisper 1.2.1）が使うのは initial_prompt の**後ろ 223 
 # プロジェクトルートで（<plugin-root> はプラグインのインストール先）
 & "<plugin-root>\transcribe.ps1" -DataDir "<CLAUDE_PLUGIN_DATA>"            # 両 inbox を全部処理
 & "<plugin-root>\transcribe.ps1" -DataDir "<CLAUDE_PLUGIN_DATA>" "memo.m4a" # 指定ファイル
-# オプション: --timestamps / --no-glossary / --no-global / --no-proofread / --keep / --device cpu / --project <dir>
+# オプション: --timestamps / --no-glossary / --no-global / --no-proofread / --no-topic / --keep / --device cpu / --project <dir> / --out-dir <dir>
+# 対象と置き場を見るだけ（文字起こし・移動・フォルダの作成をしない）: --list
 ```
 
 `-DataDir` を省略しても、ランチャーは `VOICE_MEMO_PYTHON` → `~/.claude/plugins/data/*voice-memo-kit*/.venv` → `<plugin-root>/.venv` の順に venv を探す。

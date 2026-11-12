@@ -11,6 +11,8 @@
     python transcribe.py --no-proofread        # Claude 校閲をスキップ
     python transcribe.py --keep                # 処理後に音声を inbox に残す
     python transcribe.py --device cpu          # GPU 不調時の CPU フォールバック
+    python transcribe.py --no-topic            # 話題 (topic) を付けない (config で入れたとき)
+    python transcribe.py --list                # 対象の音声と置き場を出すだけ (何もしない)
 
 設定: config.default.json（キット既定）に <project>/voice_memos/config.json を重ねて上書き。
 
@@ -18,8 +20,9 @@
 - 音声: <project>/voice_memos/inbox → ~/voice_memos/inbox の順に両方を処理（プロジェクト優先）
 - 辞書: ~/voice_memos/glossary → paths.extra_glossary_dirs（明示追加）→ <project>/voice_memos/glossary
   の順にマージ（同 canonical は後の層＝プロジェクトが優先）
-- 出力: 常に <project>/voice_memos/transcripts/<録音日>_<元ファイル名>.md
-- 退避: 音声が見つかった層の processed/
+- 出力: <project>/voice_memos/transcripts/<録音日>_<元ファイル名>.md
+  （config の output_root の候補がこの PC にあれば、その根の下。どれも無ければ根を作らずに既定の置き場。#14）
+- 退避: 音声が見つかった層の processed/（プロジェクト層は、output_root があればその根の下）
 --no-global でグローバル層を無視。
 """
 from __future__ import annotations
@@ -27,6 +30,8 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -49,7 +54,7 @@ from glossary import (
     merge_glossaries,
     plan_initial_prompt,
 )
-from proofread import describe_failure, proofread_body
+from proofread import TOPIC_MAX_CHARS, describe_failure, make_topic, proofread_body
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
 AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".mp4"}
@@ -65,6 +70,14 @@ ERROR_DETAIL_MAX_CHARS = 200
 # 1 チャンクの出力（数え直し）がこれを超えたら [WARN]。上限は 224（prompt を使い切ると 221。#4 の U3）。
 # 値は #3 の保留（1 チャンク 224 トークンの頭打ち）の再開の条件と同じ。
 CHUNK_OUTPUT_WARN_TOKENS = 200
+# 置き場の根の候補が、この PC にどれも無いときの行（SKILL.md §2・README に同じ文を書く。#14）
+OUTPUT_ROOT_MISSING_WARN = ("  [WARN] 置き場の根（output_root.candidates）が、この PC にどれもありません。"
+                            "根は作らずに、既定の置き場に出します")
+# --out-dir を渡したときは md はそこに出るので、既定に戻るのは音声の退避先だけ（README に同じ文。PR #15 のレビュー 2 回目の任意 1）
+OUTPUT_ROOT_MISSING_WARN_OUT_DIR = ("  [WARN] 置き場の根（output_root.candidates）が、この PC にどれもありません。"
+                                    "根は作らずに、音声の退避先は既定の置き場にします（md は --out-dir に出します）")
+# 展開できずに残った環境変数（$VAR・${VAR}・%VAR%）。残った候補は飛ばす
+_UNEXPANDED_VAR_RE = re.compile(r"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|%[A-Za-z_][A-Za-z0-9_]*%")
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -87,6 +100,50 @@ def load_config(project_root: Path) -> dict:
     return cfg
 
 
+def _expand_candidate(raw, project_root: Path) -> Path | None:
+    """置き場の根の候補 1 つを、この PC のパスにする。環境変数（$VAR・${VAR}・%VAR%）と ~ を展開する。
+
+    展開できない環境変数が残るもの・空のもの・文字列でないものは None（その候補は飛ばす）。
+    参照する環境変数のどれかが空のものも飛ばす（`${EMPTY}/sub` が `/sub` = ドライブの根の下を指さないように）。
+    相対パスはプロジェクトルート基準。
+    """
+    if not isinstance(raw, str):
+        return None
+    for m in _UNEXPANDED_VAR_RE.finditer(raw):
+        name = m.group(0).strip("${}%")
+        if not os.environ.get(name, "").strip():  # 無い・空の変数（無いものは下の確かめでも飛ぶ）
+            return None
+    s = os.path.expandvars(raw).strip()
+    if not s or _UNEXPANDED_VAR_RE.search(s):
+        return None
+    path = Path(s).expanduser()
+    return path if path.is_absolute() else project_root / path
+
+
+def _under_root(root: Path, rel, key: str) -> Path:
+    """根の下の相対パス（output_root.transcripts・processed）。根の外を指すもの（絶対パス・..）は断る。"""
+    rel_path = Path(rel) if isinstance(rel, str) and rel.strip() else None
+    if rel_path is None or rel_path.is_absolute() or rel_path.drive or rel_path.root or ".." in rel_path.parts:
+        raise ValueError(f"output_root.{key} は、根の下の相対パスにします（空・絶対パス・.. は使えません）")
+    return root / rel_path
+
+
+def resolve_output_root(cfg: dict, project_root: Path) -> tuple[Path | None, bool]:
+    """置き場の根（config の output_root.candidates のうち、この PC にある最初のフォルダ）。
+
+    返す値: (根, 候補はあるのにどれも無いか)。根は作らない（無いフォルダは候補として飛ばす。#14）。
+    """
+    out = cfg.get("output_root") or {}
+    candidates = out.get("candidates") or []
+    if isinstance(candidates, str):
+        candidates = [candidates]
+    for raw in candidates:
+        path = _expand_candidate(raw, project_root)
+        if path is not None and path.is_dir():
+            return path, False
+    return None, bool(candidates)
+
+
 def resolve_paths(cfg: dict, project_root: Path) -> dict:
     """プロジェクト層とグローバル層（~/voice_memos）のパスを解決する。
 
@@ -94,8 +151,11 @@ def resolve_paths(cfg: dict, project_root: Path) -> dict:
       → paths.extra_glossary_dirs（明示追加。プロジェクト共有の辞書など）
       → プロジェクト paths.glossary（既定 voice_memos/glossary、最優先）。
     - inbox: プロジェクト → グローバルの順に両方を走査。
-    - transcripts: 常にプロジェクト側（呼び出し元の作業場所に集約）。
-    - processed: 音声が見つかった層の processed/ に退避。
+    - transcripts: プロジェクト側（呼び出し元の作業場所に集約）。output_root の根があれば、その下の output_root.transcripts。
+    - processed: 音声が見つかった層の processed/ に退避。プロジェクト層は、根があればその下の output_root.processed。
+    - output_root: 使う根（無ければ None）。output_root_missing: 候補はあるのに、この PC にどれも無い
+      （そのときは根を作らずに既定の置き場。呼び出し側が [WARN] を出す）。
+    output_root の transcripts・processed が根の外を指すときは ValueError（根があってもなくても確かめる）。
     """
     p = cfg["paths"]
     glossary = project_root / p["glossary"]
@@ -107,16 +167,29 @@ def resolve_paths(cfg: dict, project_root: Path) -> dict:
     if raw:
         global_root = Path(raw).expanduser()
     g = cfg.get("global_paths", {})
+
+    transcripts = project_root / p["transcripts"]
+    processed = project_root / p["processed"]
+    out = cfg.get("output_root") or {}
+    root, missing = resolve_output_root(cfg, project_root)
+    if out.get("candidates"):
+        check = root or project_root  # 根が無い PC でも、設定の誤りは同じように知らせる
+        under = (_under_root(check, out.get("transcripts"), "transcripts"),
+                 _under_root(check, out.get("processed"), "processed"))
+        if root is not None:
+            transcripts, processed = under
     return {
         "glossary": glossary,
         "extra_glossary_dirs": extra,
         "inbox": project_root / p["inbox"],
-        "transcripts": project_root / p["transcripts"],
-        "processed": project_root / p["processed"],
+        "transcripts": transcripts,
+        "processed": processed,
         "global_root": global_root,
         "global_glossary": (global_root / g["glossary"]) if global_root and g.get("glossary") else None,
         "global_inbox": (global_root / g["inbox"]) if global_root and g.get("inbox") else None,
         "global_processed": (global_root / g["processed"]) if global_root and g.get("processed") else None,
+        "output_root": root,
+        "output_root_missing": missing,
     }
 
 
@@ -208,6 +281,24 @@ def unique_path(path: Path) -> Path:
         if not cand.exists():
             return cand
         i += 1
+
+
+def write_atomic(path: Path, text: str) -> None:
+    """`.` で始まる一時ファイルに書いてから名前を変える（ほかの道具が書きかけの md を読まない。#14）。
+
+    書き方（エンコーディング・改行）は write_text と同じ。前の回に残った同じ名前の一時ファイルは上書きする。
+    書けなかったとき（容量・権限など）は、一時ファイルを消してから例外を送り出す（置き場に残さない）。
+    """
+    tmp = path.with_name(f".{path.name}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def load_merged_glossary(paths: dict, use_global: bool) -> list[dict]:
@@ -316,6 +407,7 @@ def process_one(
     keep: bool,
     device: str,
     use_proofread: bool,
+    use_topic: bool = False,
 ) -> Path:
     print(f"\n=== {audio.name} ===")
     w = cfg["whisper"]
@@ -382,14 +474,39 @@ def process_one(
     if replacement_count > 0:
         raw_section += details_section(PRE_REPLACEMENT_SUMMARY, pre_replacement_body)
 
-    date = datetime.datetime.fromtimestamp(audio.stat().st_mtime).strftime("%Y-%m-%d")
+    # D: 話題（設定で入れたときだけ。#14）。校閲後の本文（校閲していなければ文字起こし）を Claude が読み、1 行にする。
+    # 失敗しても文字起こしは失わない（topic を書かず、理由を topic_error に残す）。
+    topic: str | None = None
+    topic_error: tuple[str, str] | None = None
+    if use_topic:
+        topic_text = main_body if proofread_status != "false" else plain_body
+        if not topic_text.strip():
+            print("[D] 文字起こしが空のため、話題を付けません")
+        else:
+            tcfg = cfg.get("topic", {})
+            model = tcfg.get("model") or cfg.get("proofread", {}).get("model", "claude-sonnet-4-6")
+            try:
+                print(f"[D] 話題を付けています（{model}）...")
+                topic = make_topic(topic_text, model=model, max_chars=int(tcfg.get("max_chars") or TOPIC_MAX_CHARS))
+                print(f"[D] 話題: {topic}")
+            except Exception as e:
+                code, detail = describe_failure(e)
+                topic_error = (code, one_line(detail))
+                print(f"  [WARN] 話題を付けられません（{code}: {topic_error[1]}）。topic を書かずに保存します")
+
+    # 録音の時刻は音声の更新時刻（今までの「録音日」と同じ出どころ）。recorded_at は時差つき（#14）
+    recorded = datetime.datetime.fromtimestamp(audio.stat().st_mtime).astimezone()
+    date = recorded.strftime("%Y-%m-%d")
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = unique_path(out_dir / f"{date}_{audio.stem}.md")
 
+    # source と topic は JSON の文字列の形で書く（YAML の二重引用符の文字列としても読める）。
+    # 音声の名前の `#`・`[`・`&` などで、ほかの道具が前付けを読み違えないため（0.7.0。#14）
     frontmatter = (
         "---\n"
         f"date: {date}\n"
-        f"source: {audio.name}\n"
+        f"recorded_at: {recorded.isoformat(timespec='seconds')}\n"
+        f"source: {json.dumps(audio.name, ensure_ascii=False)}\n"
         f"duration: {fmt_duration(result['duration'])}\n"
         f"engine: {result['engine']}\n"
         f"segments: {len(result['segments'])}\n"
@@ -402,11 +519,15 @@ def process_one(
             f"proofread_error: {proofread_error[0]}\n"
             f"proofread_error_detail: {json.dumps(proofread_error[1], ensure_ascii=False)}\n"
         )
+    if topic:
+        frontmatter += f"topic: {json.dumps(topic, ensure_ascii=False)}\n"
+    if topic_error:
+        frontmatter += (
+            f"topic_error: {topic_error[0]}\n"
+            f"topic_error_detail: {json.dumps(topic_error[1], ensure_ascii=False)}\n"
+        )
     frontmatter += "---\n\n"
-    out_path.write_text(
-        frontmatter + f"# ボイスメモ {date}\n\n" + main_body + "\n" + raw_section,
-        encoding="utf-8",
-    )
+    write_atomic(out_path, frontmatter + f"# ボイスメモ {date}\n\n" + main_body + "\n" + raw_section)
     print(f"  -> {out_path}")
 
     if not keep:
@@ -428,7 +549,7 @@ def main() -> int:
     parser.add_argument("--project", type=Path, default=None,
                         help="プロジェクトルート（省略時はカレントディレクトリ）")
     parser.add_argument("--out-dir", type=Path, default=None,
-                        help="出力先（省略時は <project>/voice_memos/transcripts）")
+                        help="出力先（省略時は <project>/voice_memos/transcripts。config の output_root の根があればその下）")
     parser.add_argument("--no-glossary", action="store_true", help="固有名詞辞書を使わない")
     parser.add_argument("--no-global", action="store_true",
                         help="グローバル層（~/voice_memos）の inbox・辞書を使わない")
@@ -437,16 +558,40 @@ def main() -> int:
     parser.add_argument("--no-proofread", action="store_true", help="Claude 校閲をスキップ")
     parser.add_argument("--device", choices=["cuda", "cpu"], default=None,
                         help="推論デバイス（省略時は config の whisper.device、既定 cuda）")
+    parser.add_argument("--no-topic", action="store_true", help="話題（topic）を付けない（config で入れたとき）")
+    parser.add_argument("--list", action="store_true",
+                        help="対象の音声と置き場を出すだけ（文字起こし・移動・フォルダの作成をしない）")
     args = parser.parse_args()
 
     project_root = (args.project or Path.cwd()).resolve()
     cfg = load_config(project_root)
     device = args.device or cfg.get("whisper", {}).get("device", "cuda")
-    paths = resolve_paths(cfg, project_root)
+    try:
+        paths = resolve_paths(cfg, project_root)
+    except ValueError as e:
+        print(f"ERROR: 設定の誤り: {e}", file=sys.stderr)
+        return 1
     out_dir = args.out_dir or paths["transcripts"]
     use_global = not args.no_global
 
+    # 置き場（SKILL.md §1・§3 はこの行を読む。決め打ちの voice_memos/transcripts を見ない）。
+    # 各行の = の後ろはパスだけ（注を付けない）。根を使ったときだけ output_root= の行を足す
+    print(f"transcripts={out_dir}")
+    print(f"processed  ={paths['processed']}")
+    if paths.get("output_root"):
+        print(f"output_root={paths['output_root']}")
+    elif paths.get("output_root_missing"):
+        print(OUTPUT_ROOT_MISSING_WARN_OUT_DIR if args.out_dir else OUTPUT_ROOT_MISSING_WARN)
+
     inputs = collect_inputs(args.input, paths, use_global)
+    if args.list:
+        for audio, processed_dir in inputs:
+            print(f"  {audio}  (退避: {processed_dir})")
+        print(f"対象 {len(inputs)} 件")
+        if not inputs and not args.input:
+            print(f"  音声の置き場: project {paths['inbox']}"
+                  + (f" / global {paths['global_inbox']}" if use_global and paths.get("global_inbox") else ""))
+        return 0
     if not inputs:
         if args.input:
             print(f"ERROR: 対象が見つかりません: {args.input}", file=sys.stderr)
@@ -463,12 +608,13 @@ def main() -> int:
         return 1
 
     use_proofread = bool(cfg.get("proofread", {}).get("enabled", True)) and not args.no_proofread
+    use_topic = bool(cfg.get("topic", {}).get("enabled", False)) and not args.no_topic
     print(f"project={project_root}")
     if use_global and paths.get("global_root"):
         print(f"global ={paths['global_root']}")
     n_proj = sum(1 for _, d in inputs if d == paths["processed"])
     print(f"対象 {len(inputs)} 件（project {n_proj} / global {len(inputs) - n_proj}） / "
-          f"device={device} / glossary={not args.no_glossary} / proofread={use_proofread}")
+          f"device={device} / glossary={not args.no_glossary} / proofread={use_proofread} / topic={use_topic}")
 
     entries = [] if args.no_glossary else load_merged_glossary(paths, use_global)
 
@@ -478,7 +624,7 @@ def main() -> int:
             done.append(process_one(
                 audio, cfg=cfg, processed_dir=processed_dir, out_dir=out_dir,
                 entries=entries, with_timestamps=args.timestamps,
-                keep=args.keep, device=device, use_proofread=use_proofread,
+                keep=args.keep, device=device, use_proofread=use_proofread, use_topic=use_topic,
             ))
         except Exception as e:
             print(f"[ERROR] {audio.name} の処理に失敗: {e}", file=sys.stderr)
