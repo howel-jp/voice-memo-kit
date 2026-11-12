@@ -25,8 +25,19 @@ import proofread  # noqa: E402
 import transcribe as t  # noqa: E402
 from test_transcribe import _ProcessOneBase  # noqa: E402  (process_one をスタブで走らせる土台)
 
+try:  # 前付けを YAML として読む道具の代わり (venv に入っていれば。無ければ JSON の確かめだけ)
+    import yaml
+except ImportError:  # pragma: no cover
+    yaml = None
+
 ENV = "VMK_TEST_OUTPUT_ROOT"  # 試しだけで使う環境変数の名前
 UNSET = "VMK_TEST_NEVER_SET_VARIABLE"
+
+
+def _yaml_front(md: str) -> dict:
+    """md の前付け (最初の --- の対の間) を YAML として読む。"""
+    assert md.startswith("---\n")
+    return yaml.safe_load(md[4:md.index("\n---\n", 4)])
 
 
 def _write_config(project: Path, data: dict) -> None:
@@ -125,8 +136,23 @@ class ResolveOutputRootTest(unittest.TestCase):
         p = t.resolve_paths(_cfg_with_root(self.project, str(self.root)), self.project)
         self.assertEqual(p["output_root"], self.root)
 
+    def test_empty_env_var_candidate_is_skipped(self):
+        other = self.base / "second"
+        other.mkdir()
+        trap = self.base / "trap"  # 空の変数を展開すると、この在るフォルダを指してしまう候補
+        trap.mkdir()
+        for value in ("", "   "):
+            for raw in ("${" + ENV + "}", "${" + ENV + "}/sub", "$" + ENV + "/sub", "${" + ENV + "}" + str(trap),
+                        "%" + ENV + "%" + str(trap)):
+                with self.subTest(value=value, raw=raw), mock.patch.dict(os.environ, {ENV: value}):
+                    # 空の変数を展開すると /sub (ドライブの根の下) になるので、候補ごと飛ばす
+                    p = t.resolve_paths(_cfg_with_root(self.project, [raw, str(other)]), self.project)
+                    self.assertEqual(p["output_root"], other)
+
     def test_subpaths_must_stay_under_the_root(self):
-        bad = ["../outside", "voice_memos/../../outside", "", "   ", None, str(self.base / "abs"), "/abs", "\\abs"]
+        bad = ["../outside", "voice_memos/../../outside", "", "   ", None, str(self.base / "abs"), "/abs"]
+        if os.name == "nt":  # Windows でない所では、\abs は相対の 1 つの名前
+            bad += ["\\abs", "C:rel", "a\\..\\..\\x"]
         for key in ("transcripts", "processed"):
             for value in bad:
                 for candidates in ([str(self.root)], [str(self.base / "missing")]):  # 根が無い PC でも同じに断る
@@ -170,6 +196,20 @@ class RecordedAtTest(_ProcessOneBase):
         self.assertEqual(r["fm"]["date"], at.strftime("%Y-%m-%d"))  # 録音日と同じ出どころ・同じ日
         self.assertRegex(r["fm"]["recorded_at"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$")
 
+    def test_source_is_a_json_string_for_names_yaml_would_misread(self):
+        # YAML の引用符なしでは null になる・切れる・前付けの全体が読めなくなる名前 (どれも合成。Windows で使える字だけ)
+        names = ["#1 memo.m4a", "a #b.m4a", "[x] memo.m4a", "&x.m4a", "!x.m4a", "%x.m4a", "@x.m4a",
+                 "'x.m4a", "{x}.m4a", "- x.m4a", "合成 メモ.m4a"]
+        self._cli(lambda b: b)
+        for name in names:
+            with self.subTest(name=name):
+                self.audio = self.root / name
+                self.audio.write_bytes(b"")
+                r = self._run()
+                self.assertEqual(json.loads(r["fm"]["source"]), name)
+                if yaml is not None:
+                    self.assertEqual(_yaml_front(r["md"])["source"], name)
+
 
 class AtomicWriteTest(_ProcessOneBase):
     def test_no_temporary_file_is_left_even_with_a_stale_one(self):
@@ -184,6 +224,27 @@ class AtomicWriteTest(_ProcessOneBase):
         r = self._run()
         self.assertEqual(sorted(p.name for p in out_dir.iterdir()), [f"{date}_memo.md"])
         self.assertEqual(r["keys"], self.KEYS)
+
+    def test_failed_replace_removes_the_temporary_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            target = Path(d) / "x.md"
+            with mock.patch.object(t.os, "replace", side_effect=PermissionError("合成の失敗")):
+                with self.assertRaises(PermissionError):
+                    t.write_atomic(target, "合成\n")
+            self.assertEqual(list(Path(d).iterdir()), [])
+
+    def test_failed_write_removes_the_partial_temporary_file(self):
+        real_write_text = Path.write_text
+
+        def partial(self_path, text, *a, **k):
+            real_write_text(self_path, text[:3], *a, **k)  # 途中まで書いてから、容量切れの代わり
+            raise OSError(28, "合成の容量切れ")
+
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(Path, "write_text", partial):
+                with self.assertRaises(OSError):
+                    t.write_atomic(Path(d) / "x.md", "合成の本文\n")
+            self.assertEqual(list(Path(d).iterdir()), [])
 
     def test_bytes_are_the_same_as_write_text(self):
         with tempfile.TemporaryDirectory() as d:
@@ -249,6 +310,27 @@ class TopicTest(_ProcessOneBase):
         self.assertEqual(topic_call["timeout"], proofread.TOPIC_TIMEOUT_SEC)
         self.assertIn("30 字まで", topic_call["message"])
         self.assertIn("[D] 話題: 合成の段取りの相談", self.stdout)
+
+    def test_quotes_backslash_colon_hash_and_dashes_survive_the_frontmatter(self):
+        # PR #15 のレビュー 1 回目の推奨 1: 前付けを読む道具が、元の文字列に戻せること (json.dumps を外すと落ちる)
+        want = '合成の "件" \\ と: #x ---'
+        self._stub(topic_reply='話題：「合成の "件" \\ と: #x ---」\n二行目')
+        r = self._run_topic()
+        self.assertEqual(r["keys"], self.KEYS + ["topic"])
+        self.assertEqual(json.loads(r["fm"]["topic"]), want)
+        self.assertEqual(r["md"].count("\n---\n"), 1)  # 前付けの終わりは 1 つだけ (話題の --- で切れない)
+        if yaml is not None:
+            front = _yaml_front(r["md"])
+            self.assertEqual(front["topic"], want)
+            self.assertEqual(front["source"], "memo.m4a")
+
+    def test_unprintable_characters_are_dropped_and_yaml_can_read_it(self):
+        # PR #15 のレビュー 1 回目の任意 2: DEL・C1 の制御文字は YAML が読めない。幅の無い字・向きの字も残さない
+        self._stub(topic_reply="合成\x7fの\u200b段\u202e取り\x9f\ufeff\u2028と\x85相談")
+        r = self._run_topic()
+        self.assertEqual(json.loads(r["fm"]["topic"]), "合成の段取り と 相談")
+        if yaml is not None:
+            self.assertEqual(_yaml_front(r["md"])["topic"], "合成の段取り と 相談")
 
     def test_without_proofread_the_transcript_is_used(self):
         self._stub()
@@ -340,6 +422,18 @@ class CleanTopicTest(unittest.TestCase):
             ("", ""),
             ("「」", ""),  # 中が空の対も外す (空として make_topic が TopicEmpty にする)
             ('""', ""),
+            # PR #15 のレビュー 1 回目の任意 1: ラベルの語だけの行は飛ばす。太字のラベルも外す
+            ("## 話題\n合成の段取り", "合成の段取り"),
+            ("話題：\n\n「合成の段取り」", "合成の段取り"),
+            ("**話題**\n合成の段取り", "合成の段取り"),
+            ("**話題:** 合成の段取り", "合成の段取り"),
+            ("**話題**：合成の段取り", "合成の段取り"),
+            ("話題の整理", "話題の整理"),  # ラベルの語で始まるだけの話題は残す
+            ("話題", ""),  # ラベルの語だけ (次の行が無い) は空
+            # 任意 2: 印字できない字は落とす。改行の類・全角の空白は空白にそろえる
+            ("合成\x7fの\u200b段取り\x9f", "合成の段取り"),
+            ("合成\u202eの\ufeff段取り", "合成の段取り"),
+            ("合成\u2028の\x85段取り　相談", "合成 の 段取り 相談"),
         ]
         for raw, want in cases:
             with self.subTest(raw=raw):
@@ -379,6 +473,7 @@ class MainListTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn(t.OUTPUT_ROOT_MISSING_WARN, out)
         self.assertIn(f"transcripts={self.project.resolve() / 'voice_memos' / 'transcripts'}\n", out)
+        self.assertNotIn("output_root=", out)
         self.assertIn("対象 1 件", out)
         self.assertFalse(missing.exists())
         self.assertFalse((self.project / "voice_memos" / "transcripts").exists())
@@ -392,8 +487,12 @@ class MainListTest(unittest.TestCase):
                                                      "processed": "attachments/voice_memos"}})
         code, out, _ = self._main("--list")
         self.assertEqual(code, 0)
-        self.assertIn(f"transcripts={root / 'voice_memos' / 'inbox'}（置き場の根: {root}）", out)
-        self.assertIn(f"processed  ={root / 'attachments' / 'voice_memos'}", out)
+        # PR #15 のレビュー 1 回目の推奨 2: = の後ろはパスだけ。根は別の行
+        lines = out.splitlines()
+        self.assertIn(f"transcripts={root / 'voice_memos' / 'inbox'}", lines)
+        self.assertIn(f"processed  ={root / 'attachments' / 'voice_memos'}", lines)
+        self.assertIn(f"output_root={root}", lines)
+        self.assertLess(lines.index(f"processed  ={root / 'attachments' / 'voice_memos'}"), lines.index(f"output_root={root}"))
         self.assertNotIn("[WARN]", out)
         self.assertEqual(sorted(p.name for p in root.iterdir()), [])  # 作らない
 
@@ -425,7 +524,10 @@ class DocsTest(unittest.TestCase):
 
     def test_skill_uses_the_launcher_for_places(self):
         self.assertIn("--list", self.skill)
+        self.assertIn('--list "<音声パス>"', self.skill)  # 引数ありの形 (PR #15 のレビュー 1 回目の任意 5)
         self.assertIn("transcripts=", self.skill)
+        self.assertIn("output_root=", self.skill)  # 根は別の行 (推奨 2)
+        self.assertIn("output_root=", self.readme)
         self.assertNotIn("Get-ChildItem voice_memos\\inbox", self.skill)
         for key in ("recorded_at", "topic", "topic_error"):
             with self.subTest(key=key):

@@ -559,8 +559,11 @@ TOPIC_INPUT_MAX_CHARS = 20000
 # 話題の 1 回の呼び出しの時間切れ（秒）。出力は 1 行なので、校閲 (900) より短くする
 TOPIC_TIMEOUT_SEC = 300
 
-# 返しの頭に付きがちなラベル（「話題：」「Topic:」など）と、行の頭の Markdown の印
-_TOPIC_LABEL_RE = re.compile(r"^(?:話題|トピック|題名|タイトル|topic|title)\s*[:：]\s*", re.IGNORECASE)
+# 返しの頭に付きがちなラベル（「話題：」「**話題:**」「Topic:」など。前後の強調の印も一緒に外す）と、行の頭の Markdown の印
+_TOPIC_LABEL_WORDS = r"(?:話題|トピック|題名|タイトル|topic|title)"
+_TOPIC_LABEL_RE = re.compile(rf"^(?:\*\*|__)?{_TOPIC_LABEL_WORDS}(?:\*\*|__)?\s*[:：]\s*(?:\*\*|__)?\s*", re.IGNORECASE)
+# ラベルの語だけの行（「## 話題」「話題：」「**話題**」）。その行は飛ばし、次の空でない行を話題にする
+_TOPIC_LABEL_ONLY_RE = re.compile(rf"^(?:\*\*|__)?{_TOPIC_LABEL_WORDS}(?:\*\*|__)?\s*[:：]?\s*(?:\*\*|__)?$", re.IGNORECASE)
 _TOPIC_MARK_RE = re.compile(r"^(?:#+|[->・]|\d+[.)])\s+")
 # 外側の括弧・引用符・強調（対になっているときだけ外す。長いものから）
 _TOPIC_PAIRS = (("**", "**"), ("「", "」"), ("『", "』"), ("【", "】"), ("（", "）"), ("(", ")"), ("[", "]"),
@@ -592,12 +595,14 @@ def _topic_message(text: str, max_chars: int) -> str:
 def clean_topic(raw: str, max_chars: int = TOPIC_MAX_CHARS) -> str:
     """Claude の返しを、話題の 1 行にする。
 
-    最初の空でない行だけを使い、頭のラベル（「話題：」など）・Markdown の印・外側の括弧と引用符を外し、
-    空白の並び（全角の空白も）を 1 つの空白にして、max_chars 字（コードポイント）で切る。
-    ファイル名に使えるかどうかは、使う側（名前を付ける道具）が決める。
+    最初の空でない行だけを使う（コードフェンスの行と、ラベルの語だけの行は飛ばす）。頭のラベル（「話題：」など）・
+    Markdown の印・外側の括弧と引用符を外し、空白の並び（全角の空白・改行の類も）を 1 つの空白にし、
+    印字できない字（制御文字・幅の無い字・向きの字など。YAML が読めない字を含む）を落として、
+    max_chars 字（コードポイント）で切る。ファイル名に使えるかどうかは、使う側（名前を付ける道具）が決める。
     """
     lines = [ln.strip() for ln in _normalize_newlines(raw).split("\n")]
-    t = next((ln for ln in lines if ln and not ln.startswith("```")), "")
+    t = next((ln for ln in lines if ln and not ln.startswith("```")
+              and not _TOPIC_LABEL_ONLY_RE.match(_TOPIC_MARK_RE.sub("", ln).strip())), "")
     for _ in range(3):  # ラベル・印・括弧が重なっていても外す
         before = t
         t = _TOPIC_LABEL_RE.sub("", _TOPIC_MARK_RE.sub("", t)).strip()
@@ -611,6 +616,8 @@ def clean_topic(raw: str, max_chars: int = TOPIC_MAX_CHARS) -> str:
         if t == before:
             break
     t = " ".join(t.split())
+    # 空白をそろえた後に、印字できない字を落とす（全角の空白は先に空白にしてあるので落ちない）
+    t = " ".join("".join(ch for ch in t if ch.isprintable()).split())
     return t[: max(1, int(max_chars))].strip()
 
 

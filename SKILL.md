@@ -26,7 +26,7 @@ voice_memos の中身はローカル限定（git 管理外が原則）なので�
 - 音声は **プロジェクト inbox → グローバル inbox の順に両方**処理される（プロジェクト優先）。transcript はプロジェクト層の置き場に出る
 - 出力の置き場（transcript とプロジェクト層の `processed/`）は、`voice_memos/config.json` の `output_root` で別のフォルダにできる。
   候補のうち、この PC にある最初のフォルダの下に出す。どれも無い PC では、根を作らずに既定の置き場（`voice_memos/transcripts/`・`processed/`）に出す。
-  どこに出るかは決め打ちで見ず、ランチャーの出力の `transcripts=`・`processed  =` の行と、各ファイルの `->` の行で知る（§1・§3）
+  どこに出るかは決め打ちで見ず、ランチャーの出力の `transcripts=`・`processed  =`（・`output_root=`）の行と、各ファイルの `->` の行で知る（§1・§3）
 - 辞書はグローバル → `extra_glossary_dirs`（`voice_memos/config.json` で明示追加したプロジェクト共有辞書、任意）→ プロジェクト `voice_memos/glossary/` の順に**マージ**（同じ canonical は後の層＝プロジェクトが優先）
 - 辞書の語は initial_prompt で Whisper に予告するが、Whisper が使うのは後ろ 223 トークン（語およそ 25 語）まで。収まらないとき、辞書の項目に `"priority": true` の印がある語を優先して届ける（README「initial_prompt の長さと、届ける語の優先」）
 - `--no-global` でグローバル層を無視できる
@@ -40,10 +40,15 @@ voice_memos の中身はローカル限定（git 管理外が原則）なので�
 `--list` は対象の音声と置き場を出すだけで、文字起こし・音声の移動・フォルダの作成をしない（ランチャーとパス変数は §2 と同じ）:
 
 ```powershell
+# 引数なし（両 inbox）
 & "${CLAUDE_PLUGIN_ROOT}\transcribe.ps1" -DataDir "${CLAUDE_PLUGIN_DATA}" --list | Out-String
+
+# 引数あり（音声ファイル/フォルダのパス）
+& "${CLAUDE_PLUGIN_ROOT}\transcribe.ps1" -DataDir "${CLAUDE_PLUGIN_DATA}" --list "<音声パス>" | Out-String
 ```
 
-- 出力の `transcripts=` の行が md の出る置き場、`processed  =` の行がプロジェクト層の音声の退避先。続く行が対象の音声、最後の行が `対象 N 件`
+- 出力の `transcripts=` の行が md の出る置き場（フォルダ）、`processed  =` の行がプロジェクト層の音声の退避先。どちらも `=` の後ろはパスだけ。
+  置き場の根（`output_root`）を使うときだけ、続けて `output_root=` の行に根が出る。その後の行が対象の音声、最後の行が `対象 N 件`
 - 対象が 0 件なら「`voice_memos/inbox/`（プロジェクト）または `~/voice_memos/inbox/`（共通）に音声を置いてください（または音声パスを指定）」と案内して終了
 - `[WARN] 置き場の根` の行があれば、§2 の同じ行の扱い
 - ランチャーが exit 2（`Python venv not found`）を返したら、§2 の「初回セットアップ」へ
@@ -104,6 +109,7 @@ voice_memos の中身はローカル限定（git 管理外が原則）なので�
 - frontmatter（`date / recorded_at / source / duration / engine / segments / glossary_replacements / proofread`。校閲に失敗したときだけ、続けて `proofread_error / proofread_error_detail`。
   話題を入れる設定のときは、続けて `topic`、付けられなかったときは `topic_error / topic_error_detail`）
   - `recorded_at`: 録音の時刻（音声のファイルの更新時刻。時差つき）。`date` はその日付
+  - `source`: 元の音声の名前（JSON の文字列の形。0.6.1 までの md は引用符なし）
   - `topic`: 何の話かの 1 行（Claude が校閲後の本文から付けた。JSON の文字列の形）。メモを探す手がかり。本文の代わりにしない
   - `topic_error`: 話題を付けようとして付けられなかった理由（`proofread_error` と同じ語）。文字起こし・校閲には効かない
   - `proofread`: 本文が Claude で校閲された文ならモデル名。`false` なら本文は校閲されていない（校閲しない設定、文字起こしが空、または校閲に失敗）。

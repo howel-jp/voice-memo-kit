@@ -101,10 +101,15 @@ def _expand_candidate(raw, project_root: Path) -> Path | None:
     """置き場の根の候補 1 つを、この PC のパスにする。環境変数（$VAR・${VAR}・%VAR%）と ~ を展開する。
 
     展開できない環境変数が残るもの・空のもの・文字列でないものは None（その候補は飛ばす）。
+    参照する環境変数のどれかが空のものも飛ばす（`${EMPTY}/sub` が `/sub` = ドライブの根の下を指さないように）。
     相対パスはプロジェクトルート基準。
     """
     if not isinstance(raw, str):
         return None
+    for m in _UNEXPANDED_VAR_RE.finditer(raw):
+        name = m.group(0).strip("${}%")
+        if not os.environ.get(name, "").strip():  # 無い・空の変数（無いものは下の確かめでも飛ぶ）
+            return None
     s = os.path.expandvars(raw).strip()
     if not s or _UNEXPANDED_VAR_RE.search(s):
         return None
@@ -278,11 +283,19 @@ def unique_path(path: Path) -> Path:
 def write_atomic(path: Path, text: str) -> None:
     """`.` で始まる一時ファイルに書いてから名前を変える（ほかの道具が書きかけの md を読まない。#14）。
 
-    書き方（エンコーディング・改行）は write_text と同じ。残った一時ファイルは次の回に上書きする。
+    書き方（エンコーディング・改行）は write_text と同じ。前の回に残った同じ名前の一時ファイルは上書きする。
+    書けなかったとき（容量・権限など）は、一時ファイルを消してから例外を送り出す（置き場に残さない）。
     """
     tmp = path.with_name(f".{path.name}.tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def load_merged_glossary(paths: dict, use_global: bool) -> list[dict]:
@@ -484,11 +497,13 @@ def process_one(
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = unique_path(out_dir / f"{date}_{audio.stem}.md")
 
+    # source と topic は JSON の文字列の形で書く（YAML の二重引用符の文字列としても読める）。
+    # 音声の名前の `#`・`[`・`&` などで、ほかの道具が前付けを読み違えないため（0.7.0。#14）
     frontmatter = (
         "---\n"
         f"date: {date}\n"
         f"recorded_at: {recorded.isoformat(timespec='seconds')}\n"
-        f"source: {audio.name}\n"
+        f"source: {json.dumps(audio.name, ensure_ascii=False)}\n"
         f"duration: {fmt_duration(result['duration'])}\n"
         f"engine: {result['engine']}\n"
         f"segments: {len(result['segments'])}\n"
@@ -556,11 +571,13 @@ def main() -> int:
     out_dir = args.out_dir or paths["transcripts"]
     use_global = not args.no_global
 
-    # 置き場（SKILL.md §1・§3 はこの行を読む。決め打ちの voice_memos/transcripts を見ない）
-    root_note = f"（置き場の根: {paths['output_root']}）" if paths.get("output_root") and not args.out_dir else ""
-    print(f"transcripts={out_dir}{root_note}")
+    # 置き場（SKILL.md §1・§3 はこの行を読む。決め打ちの voice_memos/transcripts を見ない）。
+    # 各行の = の後ろはパスだけ（注を付けない）。根を使ったときだけ output_root= の行を足す
+    print(f"transcripts={out_dir}")
     print(f"processed  ={paths['processed']}")
-    if paths.get("output_root_missing") and not args.out_dir:
+    if paths.get("output_root"):
+        print(f"output_root={paths['output_root']}")
+    elif paths.get("output_root_missing"):
         print(OUTPUT_ROOT_MISSING_WARN)
 
     inputs = collect_inputs(args.input, paths, use_global)
