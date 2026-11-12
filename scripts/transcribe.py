@@ -73,6 +73,9 @@ CHUNK_OUTPUT_WARN_TOKENS = 200
 # 置き場の根の候補が、この PC にどれも無いときの行（SKILL.md §2・README に同じ文を書く。#14）
 OUTPUT_ROOT_MISSING_WARN = ("  [WARN] 置き場の根（output_root.candidates）が、この PC にどれもありません。"
                             "根は作らずに、既定の置き場に出します")
+# --out-dir を渡したときは md はそこに出るので、既定に戻るのは音声の退避先だけ（README に同じ文。PR #15 のレビュー 2 回目の任意 1）
+OUTPUT_ROOT_MISSING_WARN_OUT_DIR = ("  [WARN] 置き場の根（output_root.candidates）が、この PC にどれもありません。"
+                                    "根は作らずに、音声の退避先は既定の置き場にします（md は --out-dir に出します）")
 # 展開できずに残った環境変数（$VAR・${VAR}・%VAR%）。残った候補は飛ばす
 _UNEXPANDED_VAR_RE = re.compile(r"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|%[A-Za-z_][A-Za-z0-9_]*%")
 
@@ -578,7 +581,7 @@ def main() -> int:
     if paths.get("output_root"):
         print(f"output_root={paths['output_root']}")
     elif paths.get("output_root_missing"):
-        print(OUTPUT_ROOT_MISSING_WARN)
+        print(OUTPUT_ROOT_MISSING_WARN_OUT_DIR if args.out_dir else OUTPUT_ROOT_MISSING_WARN)
 
     inputs = collect_inputs(args.input, paths, use_global)
     if args.list:

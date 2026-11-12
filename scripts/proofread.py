@@ -559,15 +559,17 @@ TOPIC_INPUT_MAX_CHARS = 20000
 # 話題の 1 回の呼び出しの時間切れ（秒）。出力は 1 行なので、校閲 (900) より短くする
 TOPIC_TIMEOUT_SEC = 300
 
-# 返しの頭に付きがちなラベル（「話題：」「**話題:**」「Topic:」など。前後の強調の印も一緒に外す）と、行の頭の Markdown の印
+# 返しの頭に付きがちなラベル（「話題：」「**話題:**」「**話題**：」「Topic:」など）と、行の頭の Markdown の印。
+# ラベルの前に開いた強調の印（** か __）があるときだけ、それを閉じる印を食べる（ラベルの語の直後か、コロンの直後の 1 つ）。
+# 前に開いた印が無いときは、コロンの後ろの印を食べない（「話題: **値**」の値の対を残し、後で対として外す。PR #15 のレビュー 2 回目）
 _TOPIC_LABEL_WORDS = r"(?:話題|トピック|題名|タイトル|topic|title)"
-_TOPIC_LABEL_RE = re.compile(rf"^(?:\*\*|__)?{_TOPIC_LABEL_WORDS}(?:\*\*|__)?\s*[:：]\s*(?:\*\*|__)?\s*", re.IGNORECASE)
+_TOPIC_LABEL_RE = re.compile(rf"^(\*\*|__)?{_TOPIC_LABEL_WORDS}(?:\1\s*[:：]|\s*[:：]\s*(?:\1)?)\s*", re.IGNORECASE)
 # ラベルの語だけの行（「## 話題」「話題：」「**話題**」）。その行は飛ばし、次の空でない行を話題にする
 _TOPIC_LABEL_ONLY_RE = re.compile(rf"^(?:\*\*|__)?{_TOPIC_LABEL_WORDS}(?:\*\*|__)?\s*[:：]?\s*(?:\*\*|__)?$", re.IGNORECASE)
 _TOPIC_MARK_RE = re.compile(r"^(?:#+|[->・]|\d+[.)])\s+")
 # 外側の括弧・引用符・強調（対になっているときだけ外す。長いものから）
-_TOPIC_PAIRS = (("**", "**"), ("「", "」"), ("『", "』"), ("【", "】"), ("（", "）"), ("(", ")"), ("[", "]"),
-                ('"', '"'), ("'", "'"), ("“", "”"), ("‘", "’"), ("`", "`"), ("*", "*"))
+_TOPIC_PAIRS = (("**", "**"), ("__", "__"), ("「", "」"), ("『", "』"), ("【", "】"), ("（", "）"), ("(", ")"),
+                ("[", "]"), ('"', '"'), ("'", "'"), ("“", "”"), ("‘", "’"), ("`", "`"), ("*", "*"))
 
 
 class TopicEmpty(ProofreadRejected):
@@ -603,9 +605,10 @@ def clean_topic(raw: str, max_chars: int = TOPIC_MAX_CHARS) -> str:
     lines = [ln.strip() for ln in _normalize_newlines(raw).split("\n")]
     t = next((ln for ln in lines if ln and not ln.startswith("```")
               and not _TOPIC_LABEL_ONLY_RE.match(_TOPIC_MARK_RE.sub("", ln).strip())), "")
-    for _ in range(3):  # ラベル・印・括弧が重なっていても外す
+    for _ in range(5):  # 印・括弧・ラベルが重なっていても外す
         before = t
-        t = _TOPIC_LABEL_RE.sub("", _TOPIC_MARK_RE.sub("", t)).strip()
+        t = _TOPIC_MARK_RE.sub("", t).strip()
+        # 行の全体を囲む対（「**話題：値**」の ** など）は、ラベルより先に外す
         for o, c in _TOPIC_PAIRS:
             inner = t[len(o): len(t) - len(c)]
             # 外側の 1 対が全体を囲むときだけ（「A」と「B」のように中にも同じ括弧があるものは外さない）。
@@ -613,6 +616,7 @@ def clean_topic(raw: str, max_chars: int = TOPIC_MAX_CHARS) -> str:
             if len(t) >= len(o) + len(c) and t.startswith(o) and t.endswith(c) and o not in inner and c not in inner:
                 t = inner.strip()
                 break
+        t = _TOPIC_LABEL_RE.sub("", t).strip()
         if t == before:
             break
     t = " ".join(t.split())

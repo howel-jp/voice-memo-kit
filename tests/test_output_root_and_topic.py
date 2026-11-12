@@ -430,6 +430,16 @@ class CleanTopicTest(unittest.TestCase):
             ("**話題**：合成の段取り", "合成の段取り"),
             ("話題の整理", "話題の整理"),  # ラベルの語で始まるだけの話題は残す
             ("話題", ""),  # ラベルの語だけ (次の行が無い) は空
+            # PR #15 のレビュー 2 回目の推奨 1: 値が太字のとき、後ろに ** を残さない (1 回目の head と同じ形)
+            ("話題: **合成の段取り**", "合成の段取り"),
+            ("話題：**合成の段取り**", "合成の段取り"),
+            ("**話題：合成の段取り**", "合成の段取り"),  # 行の全体が太字
+            ("Topic: **synthetic plan**", "synthetic plan"),
+            ("話題: __合成の段取り__", "合成の段取り"),  # __ の対も外す (1 回目の head では残っていた)
+            ("**話題**：**合成の段取り**", "合成の段取り"),
+            ("__話題__: 合成の段取り", "合成の段取り"),
+            ("__init__ の整理", "__init__ の整理"),  # 全体を囲まない __ は残す
+            ("titles の整理", "titles の整理"),
             # 任意 2: 印字できない字は落とす。改行の類・全角の空白は空白にそろえる
             ("合成\x7fの\u200b段取り\x9f", "合成の段取り"),
             ("合成\u202eの\ufeff段取り", "合成の段取り"),
@@ -480,6 +490,19 @@ class MainListTest(unittest.TestCase):
         self.assertFalse((self.project / "voice_memos" / "processed").exists())
         self.assertTrue(self.audio.exists())
 
+    def test_missing_root_with_out_dir_warns_only_about_the_audio(self):
+        # PR #15 のレビュー 2 回目の任意 1: md は --out-dir に出るので、既定に戻るのは音声の退避先だけ
+        missing = self.base / "notes_repo_not_on_this_pc"
+        out_dir = self.base / "elsewhere"
+        _write_config(self.project, {"output_root": {"candidates": [str(missing)]}})
+        code, out, _ = self._main("--list", "--out-dir", str(out_dir))
+        self.assertEqual(code, 0)
+        self.assertIn(t.OUTPUT_ROOT_MISSING_WARN_OUT_DIR, out.splitlines())
+        self.assertNotIn(t.OUTPUT_ROOT_MISSING_WARN, out.splitlines())
+        self.assertIn(f"transcripts={out_dir}", out.splitlines())
+        self.assertFalse(out_dir.exists())  # --list は作らない
+        self.assertFalse(missing.exists())
+
     def test_existing_root_is_shown(self):
         root = self.base / "other_repo"
         root.mkdir()
@@ -521,6 +544,9 @@ class DocsTest(unittest.TestCase):
         for name, doc in (("SKILL.md", self.skill), ("README.md", self.readme)):
             with self.subTest(doc=name):
                 self.assertIn(text, doc)
+        # --out-dir のときの後半の文は README に書く (SKILL.md は --out-dir を使わない)
+        tail = t.OUTPUT_ROOT_MISSING_WARN_OUT_DIR.split("ありません。", 1)[1]
+        self.assertIn(tail, self.readme)
 
     def test_skill_uses_the_launcher_for_places(self):
         self.assertIn("--list", self.skill)
