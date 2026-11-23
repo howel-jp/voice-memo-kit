@@ -34,7 +34,6 @@ import argparse
 import datetime
 import json
 import locale
-import math
 import os
 import re
 import shutil
@@ -88,15 +87,21 @@ _UNEXPANDED_VAR_RE = re.compile(r"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|%[A-Za-z_][A-Za
 
 # 終わりの知らせ（on_complete。#16）。行の決まった部分は README・SKILL.md に同じ文を書く（tests/test_on_complete.py の DocsTest）
 ON_COMPLETE_DEFAULT_TIMEOUT_SEC = 120
+# 上限の秒の上限（1 日）。Windows の待ちはミリ秒の 32 ビット（約 49.7 日）で、超えると回り込む（PR #17 のレビュー 1 回目の任意 3）
+ON_COMPLETE_MAX_TIMEOUT_SEC = 86400
 ON_COMPLETE_FAILED = "終わりの知らせのコマンドが失敗しました"
 ON_COMPLETE_TIMED_OUT = "秒で終わらないため止めました"  # 前に「終わりの知らせのコマンドが <上限> 」が付く
 ON_COMPLETE_CANNOT_START = "終わりの知らせのコマンドを起こせません"
 ON_COMPLETE_DONE_NOTE = "文字起こしは済んでいます"
+ON_COMPLETE_EXE_ONLY = ("起こすのは実行ファイル（.exe）だけです。cmd・.bat・.cmd は md のパスの & % ^ をコマンドとして読みうるため。"
+                        "node・python・powershell -File などを最初に書きます")
 # 出力の要点（最後の空でない行）の長さの上限と、要点を探すために読む出力の末尾のバイト数
 ON_COMPLETE_TAIL_MAX_CHARS = 200
 ON_COMPLETE_READ_TAIL_BYTES = 64 * 1024
-# Windows が cmd.exe に読ませるもの。md のパスの & % ^（音声の名前から来る）がコマンドとして読まれうるので起こさない
-_BATCH_SUFFIXES = (".bat", ".cmd")
+# Windows で起こすのは実行ファイル（.exe・.com。拡張子なしは CreateProcess が .exe を足す）だけ。
+# cmd と .bat・.cmd などは、md のパスの & % ^（音声の名前から来る）をコマンドとして読みうるので起こさない（PR #17 のレビュー 1 回目の推奨 3・任意 1）
+_SAFE_EXTS = ("", ".exe", ".com")
+_SHELL_NAMES = ("cmd", "cmd.exe")
 # 端末の色などの印（ANSI の CSI 列）。出力の要点から外す
 _ANSI_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
@@ -579,21 +584,63 @@ def on_complete_settings(cfg: dict) -> tuple[list[str], float] | None:
     if not isinstance(command, list) or not all(isinstance(a, str) and a.strip() for a in command):
         raise ValueError("on_complete.command は、空でない文字列の配列にします（シェルを通さないので、1 つの文字列には書けません）")
     timeout = oc.get("timeout_sec", ON_COMPLETE_DEFAULT_TIMEOUT_SEC)
-    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
-        raise ValueError("on_complete.timeout_sec は正の数（秒）にします")
+    # 比べるだけで確かめる（NaN・Infinity・大きすぎる整数も、float にせずに誤りになる）
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not (0 < timeout <= ON_COMPLETE_MAX_TIMEOUT_SEC):
+        raise ValueError(f"on_complete.timeout_sec は {ON_COMPLETE_MAX_TIMEOUT_SEC} までの正の数（秒）にします")
     return list(command), float(timeout)
+
+
+def _find_on_path(name: str) -> str | None:
+    """区切りの無い名前を、PATH のフォルダだけで引く（PR #17 のレビュー 1 回目の推奨 2）。
+
+    Windows の CreateProcess は、PATH より先に、起こした側の exe のフォルダとカレントを探すので、それに任せない。
+    Windows では、PATH のフォルダごとに、名前のまま（拡張子があるとき）と PATHEXT の拡張子を足したものを試す
+    （npm → npm.cmd のように見つかったものは、run_on_complete が理由を添えて断る）。相対のフォルダ（. など）は見ない。
+    """
+    if os.name != "nt":
+        return shutil.which(name)
+    # 拡張子は小文字で試す（大文字小文字を区別しない。行に出る名前が "node.EXE" にならないように）
+    exts = [e.lower() for e in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(os.pathsep) if e]
+    names = ([name] if os.path.splitext(name)[1] else []) + [name + e for e in exts]
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        d = d.strip().strip('"')
+        if not d or not os.path.isabs(d):
+            continue
+        for n in names:
+            p = os.path.join(d, n)
+            if os.path.isfile(p):
+                return p
+    return None
 
 
 def on_complete_argv(command: list[str], md_path: Path, project_root: Path) -> list[str]:
     """起こす引数の列: command + [md の絶対パス]。
 
-    command[0] が区切りを含む相対パスなら、プロジェクトルート基準にする（区切りの無い名前は PATH で引く）。
+    command[0] が区切りを含む相対パスなら、プロジェクトルート基準にする。区切りの無い名前は PATH だけで引く
+    （見つからなければ FileNotFoundError）。
     md のパスは os.path.abspath（ジャンクションをたどらない。--out-dir が相対パスでも絶対パスになる）。
     """
     exe = command[0]
-    if ("/" in exe or "\\" in exe) and not os.path.isabs(exe):
-        exe = str(project_root / exe)
+    if "/" in exe or "\\" in exe:
+        if not os.path.isabs(exe):
+            exe = str(project_root / exe)
+    else:
+        found = _find_on_path(exe)
+        if found is None:
+            raise FileNotFoundError(f"PATH に見つかりません: {exe}")
+        exe = found
     return [exe, *command[1:], os.path.abspath(md_path)]
+
+
+def _unsafe_program(exe: str) -> bool:
+    """Windows で起こさないもの: cmd と、実行ファイル（.exe・.com・拡張子なし）でないもの（.bat・.cmd など）。
+
+    Windows は名前の末尾の空白と . を落として開くので、落としてから確かめる（"hook.cmd " も .cmd）。
+    """
+    if os.name != "nt":
+        return False
+    base = os.path.basename(exe.rstrip(" .")).lower()
+    return base in _SHELL_NAMES or os.path.splitext(base)[1] not in _SAFE_EXTS
 
 
 def _decode_output(data: bytes) -> str:
@@ -619,8 +666,9 @@ def _read_last_line(f) -> str:
     data = f.read()
     if start and b"\n" in data:  # 途中から読んだときは、切れた最初の行を捨てる（UTF-8 の字の途中で切れることもある）
         data = data[data.index(b"\n") + 1:]
-    for line in reversed(_decode_output(data).splitlines()):
-        line = _ANSI_CSI_RE.sub("", line)
+    # 行ごとに読む（UTF-8 の行とそうでない行が混じっても、最後の行を読み違えない。PR #17 のレビュー 1 回目の任意 2）
+    for raw in reversed(data.splitlines()):
+        line = _ANSI_CSI_RE.sub("", _decode_output(raw))
         line = "".join(ch if ch.isprintable() else (" " if ch.isspace() else "") for ch in line)
         if line.strip():
             return one_line(line, ON_COMPLETE_TAIL_MAX_CHARS)
@@ -660,8 +708,8 @@ def run_on_complete(md_path: Path, command: list[str], timeout: float, project_r
 
     try:
         argv = on_complete_argv(command, md_path, project_root)
-        if argv[0].lower().endswith(_BATCH_SUFFIXES):
-            return cannot_start(".bat・.cmd は起こしません。node・python・powershell -File などの実行ファイルを最初に書きます")
+        if _unsafe_program(argv[0]):
+            return cannot_start(f"{os.path.basename(argv[0])} は起こしません。{ON_COMPLETE_EXE_ONLY}")
         with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
             try:
                 proc = subprocess.Popen(argv, cwd=str(project_root), stdin=subprocess.DEVNULL, stdout=out, stderr=err)
@@ -731,11 +779,19 @@ def main() -> int:
     elif paths.get("output_root_missing"):
         print(OUTPUT_ROOT_MISSING_WARN_OUT_DIR if args.out_dir else OUTPUT_ROOT_MISSING_WARN)
 
+    if args.no_on_complete:
+        on_complete = None
+    # 設定の行。--list でも出す（待つ時間を前もって見積もれる。PR #17 のレビュー 1 回目の推奨 1）
+    on_complete_line = (f"[E] 終わりの知らせ: md を書くたびに走らせます（上限 {on_complete[1]:g} 秒）: "
+                        f"{subprocess.list2cmdline(on_complete[0])}") if on_complete else ""
+
     inputs = collect_inputs(args.input, paths, use_global)
     if args.list:
         for audio, processed_dir in inputs:
             print(f"  {audio}  (退避: {processed_dir})")
         print(f"対象 {len(inputs)} 件")
+        if on_complete_line:
+            print(on_complete_line)
         if not inputs and not args.input:
             print(f"  音声の置き場: project {paths['inbox']}"
                   + (f" / global {paths['global_inbox']}" if use_global and paths.get("global_inbox") else ""))
@@ -763,11 +819,8 @@ def main() -> int:
     n_proj = sum(1 for _, d in inputs if d == paths["processed"])
     print(f"対象 {len(inputs)} 件（project {n_proj} / global {len(inputs) - n_proj}） / "
           f"device={device} / glossary={not args.no_glossary} / proofread={use_proofread} / topic={use_topic}")
-    if args.no_on_complete:
-        on_complete = None
-    if on_complete:
-        print(f"[E] 終わりの知らせ: md を書くたびに走らせます（上限 {on_complete[1]:g} 秒）: "
-              f"{subprocess.list2cmdline(on_complete[0])}")
+    if on_complete_line:
+        print(on_complete_line)
 
     entries = [] if args.no_glossary else load_merged_glossary(paths, use_global)
 

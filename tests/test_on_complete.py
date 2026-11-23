@@ -90,6 +90,8 @@ class SettingsTest(unittest.TestCase):
                          (["node"], 0.5))
         self.assertEqual(t.on_complete_settings({"on_complete": {"command": ["node"], "timeout_sec": 60}}),
                          (["node"], 60.0))
+        self.assertEqual(t.on_complete_settings({"on_complete": {"command": ["node"], "timeout_sec": 86400}}),
+                         (["node"], 86400.0))
 
     def test_wrong_shapes_are_errors(self):
         wrong = [
@@ -105,6 +107,10 @@ class SettingsTest(unittest.TestCase):
             {"command": ["node"], "timeout_sec": None},
             {"command": ["node"], "timeout_sec": math.inf},
             {"command": ["node"], "timeout_sec": math.nan},
+            # PR #17 のレビュー 1 回目の任意 3: Windows の待ち (ミリ秒の 32 ビット) で回り込む値と、float にできない整数
+            {"command": ["node"], "timeout_sec": 86400.5},
+            {"command": ["node"], "timeout_sec": 4294967.296},
+            {"command": ["node"], "timeout_sec": 10 ** 400},
         ]
         for oc in wrong:
             with self.subTest(oc=oc):
@@ -135,8 +141,8 @@ class ArgvTest(unittest.TestCase):
         self.md = self.root / "out" / "2026-01-02_合成 & メモ.md"
 
     def test_md_path_is_the_last_absolute_argument(self):
-        argv = t.on_complete_argv(["node", "tools/x.mjs", "--flag"], self.md, self.root)
-        self.assertEqual(argv, ["node", "tools/x.mjs", "--flag", os.path.abspath(self.md)])
+        argv = t.on_complete_argv([PY, "tools/x.mjs", "--flag"], self.md, self.root)
+        self.assertEqual(argv, [PY, "tools/x.mjs", "--flag", os.path.abspath(self.md)])
 
     def test_relative_md_path_becomes_absolute(self):
         argv = t.on_complete_argv(["node"], Path("rel") / "a.md", self.root)
@@ -148,9 +154,51 @@ class ArgvTest(unittest.TestCase):
             with self.subTest(prog=prog):
                 self.assertEqual(t.on_complete_argv([prog], self.md, self.root)[0], str(self.root / prog))
 
-    def test_bare_name_and_absolute_program_are_kept(self):
-        self.assertEqual(t.on_complete_argv(["node"], self.md, self.root)[0], "node")
+    def test_absolute_program_is_kept(self):
         self.assertEqual(t.on_complete_argv([PY], self.md, self.root)[0], PY)
+
+
+@unittest.skipUnless(os.name == "nt", "PATHEXT と CreateProcess の探し方は Windows のもの")
+class FindOnPathTest(unittest.TestCase):
+    """区切りの無い名前は PATH のフォルダだけで引く (PR #17 のレビュー 1 回目の推奨 2)。"""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.a, self.b, self.cwd = self.root / "a", self.root / "b", self.root / "cwd"
+        for d in (self.a, self.b, self.cwd):
+            d.mkdir()
+        old = os.getcwd()
+        os.chdir(self.cwd)
+        self.addCleanup(os.chdir, old)
+
+    def env(self, *dirs: Path, pathext: str = ".COM;.EXE;.BAT;.CMD"):
+        return mock.patch.dict(os.environ, {"PATH": os.pathsep.join(str(d) for d in dirs), "PATHEXT": pathext})
+
+    def test_first_folder_on_path_with_pathext(self):
+        (self.b / "tool.EXE").write_bytes(b"")
+        with self.env(self.a, self.b):
+            self.assertEqual(t._find_on_path("tool"), str(self.b / "tool.exe"))  # 拡張子は小文字で試す
+        (self.a / "tool.CMD").write_bytes(b"")
+        with self.env(self.a, self.b):  # フォルダの順が先 (a の .cmd が b の .exe より先に見つかる)
+            self.assertEqual(os.path.normcase(t._find_on_path("tool")), os.path.normcase(str(self.a / "tool.cmd")))
+
+    def test_current_folder_and_relative_entries_are_not_searched(self):
+        (self.cwd / "tool.exe").write_bytes(b"")
+        with self.env(self.a, Path(".")):
+            self.assertIsNone(t._find_on_path("tool"))
+        with self.env(self.a):
+            with self.assertRaises(FileNotFoundError) as cm:
+                t.on_complete_argv(["tool"], self.root / "x.md", self.root)
+        self.assertIn("PATH に見つかりません: tool", str(cm.exception))
+
+    def test_name_with_an_extension_is_tried_as_it_is(self):
+        (self.a / "tool.exe").write_bytes(b"")
+        with self.env(self.a):
+            self.assertEqual(t._find_on_path("tool.exe"), str(self.a / "tool.exe"))
+            self.assertEqual(t.on_complete_argv(["tool.exe"], self.root / "x.md", self.root)[0],
+                             str(self.a / "tool.exe"))
 
 
 class RunOnCompleteTest(unittest.TestCase):
@@ -233,19 +281,80 @@ class RunOnCompleteTest(unittest.TestCase):
         self.assertTrue(line.startswith(f"  [WARN] {t.ON_COMPLETE_CANNOT_START}（FileNotFoundError"), line)
         self.assertTrue(line.endswith(f"）。{t.ON_COMPLETE_DONE_NOTE}"))
 
-    def test_batch_files_are_not_started(self):
+    @unittest.skipUnless(os.name == "nt", "cmd.exe に読ませるのは Windows")
+    def test_batch_files_and_cmd_are_not_started(self):
         marker = self.root / "batch_ran.txt"
-        for name in ("hook.cmd", "HOOK.BAT"):
-            with self.subTest(name=name):
-                bat = _write(self.root / name, f'@echo off\r\necho ran> "{marker}"\r\n')
+        _write(self.root / "hook.cmd", f'@echo off\r\necho ran> "{marker}"\r\n')
+        _write(self.root / "HOOK.BAT", f'@echo off\r\necho ran> "{marker}"\r\n')
+        cmd_exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "cmd.exe")
+        cases = [
+            [str(self.root / "hook.cmd")],
+            [str(self.root / "HOOK.BAT")],
+            # PR #17 のレビュー 1 回目の任意 1: Windows は名前の末尾の空白と . を落として開く
+            [str(self.root / "hook.cmd ")],
+            [str(self.root / "hook.cmd.")],
+            # 推奨 3: cmd /c を最初に書く形
+            ["cmd", "/c", "echo"],
+            [cmd_exe, "/c", "echo"],
+            [cmd_exe[:-len(".exe")] + " ", "/c", "echo"],  # 拡張子なし + 末尾の空白 (Windows は cmd.exe を開く)
+            [str(self.root / "tool.ps1")],  # .exe でないもの
+        ]
+        for command in cases:
+            with self.subTest(command=command):
                 with mock.patch.object(t.subprocess, "Popen") as popen:
-                    line = t.run_on_complete(self.md, [str(bat)], 30, self.root)
+                    line = t.run_on_complete(self.md, command, 30, self.root)
                 popen.assert_not_called()
                 self.assertIn(t.ON_COMPLETE_CANNOT_START, line)
-                self.assertIn(".bat・.cmd は起こしません", line)
+                self.assertIn("起こすのは実行ファイル（.exe）だけです", line)
                 # 差し替えなしでも起こさない
-                t.run_on_complete(self.md, [str(bat)], 30, self.root)
+                t.run_on_complete(self.md, command, 30, self.root)
                 self.assertFalse(marker.exists())
+
+    @unittest.skipUnless(os.name == "nt", "拡張子で決めるのは Windows")
+    def test_executables_are_allowed_even_with_a_trailing_space_or_dot(self):
+        for exe in (PY, PY + " ", PY + ".", r"C:\tools\hook", r"C:\tools\hook.COM", r"C:\my.tools\hook"):
+            with self.subTest(exe=exe):
+                self.assertFalse(t._unsafe_program(exe))
+        for exe in (r"C:\tools\hook.cmd", r"C:\tools\hook.bat ", r"C:\tools\cmd", r"C:\tools\CMD.EXE. ", r"C:\tools\x.ps1"):
+            with self.subTest(exe=exe):
+                self.assertTrue(t._unsafe_program(exe))
+
+    @unittest.skipUnless(os.name == "nt", "PATHEXT は Windows のもの")
+    def test_bare_name_that_is_a_cmd_on_path_is_refused_with_the_reason(self):
+        # npm のように、名前だけで書いたものの中身が .cmd のとき
+        bindir = self.root / "bin"
+        _write(bindir / "npmlike.cmd", "@echo off\r\n")
+        with mock.patch.dict(os.environ, {"PATH": str(bindir)}), mock.patch.object(t.subprocess, "Popen") as popen:
+            line = t.run_on_complete(self.md, ["npmlike", "run", "x"], 30, self.root)
+        popen.assert_not_called()
+        self.assertIn("npmlike.cmd は起こしません", line)
+
+    def test_bare_name_is_looked_up_on_path_and_run(self):
+        out = self.root / "argv0.txt"
+        script = _write(self.root / "argv0.py", f"import sys\nopen({str(out)!r}, 'w', encoding='utf-8').write(sys.executable)\n")
+        name = Path(PY).stem  # python
+        with mock.patch.dict(os.environ, {"PATH": str(Path(PY).parent)}):
+            line = t.run_on_complete(self.md, [name, "-I", str(script)], 30, self.root)
+        self.assertEqual(line, "[E] 終わりの知らせ: exit 0")
+        self.assertTrue(out.exists())
+
+    def test_missing_bare_name_cannot_start(self):
+        with mock.patch.dict(os.environ, {"PATH": str(self.root / "empty")}):
+            line = t.run_on_complete(self.md, ["no_such_tool_for_test"], 30, self.root)
+        self.assertEqual(line, f"  [WARN] {t.ON_COMPLETE_CANNOT_START}（FileNotFoundError: PATH に見つかりません: "
+                               f"no_such_tool_for_test）。{t.ON_COMPLETE_DONE_NOTE}")
+
+    def test_returns_while_a_grandchild_still_holds_the_output(self):
+        # stdout・stderr を一時ファイルで受ける理由 (#4 の U5。PR #17 のレビュー 1 回目の任意 5):
+        # pipe だと、孫が出力を持っている間は、子が終わっても返らない
+        code = ("import subprocess, sys, tempfile\n"
+                "subprocess.Popen([sys.executable, '-I', '-c', 'import time; time.sleep(6)'],"
+                " stdout=sys.stdout, stderr=sys.stderr, cwd=tempfile.gettempdir())\n"
+                "print('孫を残して終わります')\n")
+        start = time.monotonic()
+        line = self.run_code(code)
+        self.assertLess(time.monotonic() - start, 4)
+        self.assertEqual(line, "[E] 終わりの知らせ: exit 0（孫を残して終わります）")
 
     def test_cwd_is_the_project_root_and_no_shell(self):
         out = self.root / "seen.json"
@@ -267,6 +376,16 @@ class RunOnCompleteTest(unittest.TestCase):
             self.assertEqual(t._read_last_line(f), "最後の行")
         with tempfile.TemporaryFile() as f:
             self.assertEqual(t._read_last_line(f), "")
+
+    def test_lines_in_different_encodings_are_read_one_by_one(self):
+        # PR #17 のレビュー 1 回目の任意 2: UTF-8 でない行が混じっても、最後の UTF-8 の行は化けない
+        with tempfile.TemporaryFile() as f:
+            f.write("前の行".encode("cp932") + b"\r\n" + "最後の行".encode("utf-8") + b"\r\n")
+            self.assertEqual(t._read_last_line(f), "最後の行")
+        if os.name == "nt" and "合成の字".encode("cp932").decode("mbcs", "replace") == "合成の字":
+            with tempfile.TemporaryFile() as f:
+                f.write("前の行".encode("utf-8") + b"\n" + "合成の字".encode("cp932") + b"\n")
+                self.assertEqual(t._read_last_line(f), "合成の字")
 
 
 class MainOnCompleteTest(unittest.TestCase):
@@ -413,11 +532,18 @@ class MainOnCompleteTest(unittest.TestCase):
         self.assertNotIn("[E]", out)
         self.assertEqual(len(self.transcripts()), 1)
 
-    def test_list_starts_nothing(self):
-        self.config({"command": self.hook_command()})
+    def test_list_shows_the_setting_and_starts_nothing(self):
+        self.config({"command": self.hook_command(), "timeout_sec": 30})
         code, out, _ = self.main("--list")
         self.assertEqual(code, 0)
         self.assertEqual(self.records(), [])
+        # PR #17 のレビュー 1 回目の推奨 1: 待つ時間を前もって見積もれるように、設定の行は --list でも出す
+        lines = out.splitlines()
+        start = f"[E] 終わりの知らせ: md を書くたびに走らせます（上限 30 秒）: {subprocess.list2cmdline(self.hook_command())}"
+        self.assertIn(start, lines)
+        self.assertLess(lines.index("対象 1 件"), lines.index(start))
+        self.assertNotIn("exit", out)
+        code, out, _ = self.main("--list", "--no-on-complete")
         self.assertNotIn("[E]", out)
 
     def test_wrong_config_stops_before_transcribing(self):
@@ -445,12 +571,19 @@ class DocsTest(unittest.TestCase):
                 self.assertIn(text, self.readme)
 
     def test_readme_documents_the_setting(self):
-        for word in ("on_complete", '"command"', '"timeout_sec"', "--no-on-complete", ".bat", ".cmd"):
+        for word in ("on_complete", '"command"', '"timeout_sec"', "--no-on-complete", ".bat", ".cmd",
+                     "PATH のフォルダだけで引く", "PATH に見つかりません", "powershell -Command", '"-File"',
+                     "秘密は環境変数で渡す", str(t.ON_COMPLETE_MAX_TIMEOUT_SEC)):
             with self.subTest(word=word):
                 self.assertIn(word, self.readme)
 
     def test_skill_tells_the_user_about_the_warning(self):
         self.assertIn("[WARN] 終わりの知らせ", self.skill)
+
+    def test_skill_counts_the_wait_in_the_estimate(self):
+        # PR #17 のレビュー 1 回目の推奨 1
+        self.assertIn("[E] 終わりの知らせ: md を書くたびに走らせます", self.skill)
+        self.assertIn("対象の数 × 行の上限の秒", self.skill)
 
     def test_default_config(self):
         cfg = json.loads((Path(t.SKILL_DIR) / "config.default.json").read_text(encoding="utf-8"))
