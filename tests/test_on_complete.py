@@ -474,6 +474,33 @@ class MovedTest(unittest.TestCase):
             with self.subTest(data=data):
                 self.assert_moved(self.run_writer(data), dest)
 
+    def test_moved_to_is_normalized(self):
+        # README の約束: moved_to と移り先の行は、正規化した絶対パス (PR #21 のレビュー 1 回目の推奨 1)
+        dest = _write(self.root / "保管" / "記録.md", "")
+        written = str(self.root / "保管" / "下" / ".." / "記録.md").replace("\\", "/")
+        result = self.run_writer(f"moved: {written}\n".encode("utf-8"))
+        self.assert_moved(result, dest)
+        self.assertNotIn("..", result.moved_to)
+        if os.name == "nt":
+            self.assertNotIn("/", result.moved_to)
+
+    def test_moved_must_start_the_line(self):
+        # 行の途中の moved: は読まない (同、推奨 1)。前の見えない字 (BOM・BEL・ゼロ幅の空白) は外して読む (同、任意 1)
+        dest = _write(self.root / "保管" / "記録.md", "")
+        self.assert_not_moved(self.run_writer(f"済みました moved: {dest}\n".encode("utf-8")))
+        for head in ("﻿", "\x07", "​", "﻿​ "):
+            with self.subTest(head=head):
+                self.assert_moved(self.run_writer(f"{head}moved: {dest}\n".encode("utf-8")), dest)
+
+    def test_invisible_characters_inside_the_mark_are_a_warning(self):
+        # 見えない字を落とすと moved: の行に見えるのに、そのままでは読めない行は、黙らずに WARN (同、任意 1)
+        dest = _write(self.root / "保管" / "記録.md", "")
+        for data in (f"moved: {dest}\n".encode("utf-16-le"), f"mo​ved: {dest}\n".encode("utf-8")):
+            with self.subTest(data=data[:12]):
+                result = self.run_writer(data)
+                self.assertIn("moved:", result.line)  # 要点には moved: と出る
+                self.assert_unusable(result, "印字できない字が混じっています")
+
     def test_path_in_the_windows_code_page(self):
         # UTF-8 で読めない行は Windows の既定のコードページで読む (要点と同じ)
         dest = _write(self.root / "保管" / "合成の記録.md", "")
@@ -802,6 +829,19 @@ class DocsTest(unittest.TestCase):
         self.assertIn("利用者に聞く", section3)
         # §2 の終わりの確かめは、md を動かす設定ではフォルダの数で見ない
         self.assertIn("フォルダの md の数では見ずに `完了: m/n 件` の行で見る", self.skill)
+
+    def test_skill_section2_tells_what_the_moved_lines_mean(self):
+        # PR #21 のレビュー 1 回目の推奨 2・任意 2: §2 は、移り先の行の意味と、WARN の行のときは先に -> のパスを読むことを書く
+        section2 = self.skill.split("## 2.", 1)[1].split("\n## ", 1)[0]
+        moved_item = section2.split(f"- `{t.ON_COMPLETE_MOVED_HEAD}<パス>` の行は", 1)[1].split("\n- ", 1)[0]
+        self.assertIn("§3 ではこのパスを読む", moved_item)
+        self.assertIn("`  moved: <パス>` の行（音声の退避先）とは別物", moved_item)
+        warn_item = section2.split(f"- `[WARN] {t.ON_COMPLETE_MOVED_UNUSABLE}` で始まる行が出たら", 1)[1].split("\n- ", 1)[0]
+        self.assertIn("§3 では `->` の行のパスを読む。そこにも md が無ければ", warn_item)
+        self.assertIn("md が動いていないこともある", warn_item)
+        # 成否の見方は、md の置き場のフォルダではなく、終了コードと完了の行
+        self.assertIn("成否は終了コードと `完了: m/n 件` の行で判断する", section2)
+        self.assertNotIn("transcript 生成有無で判断する", self.skill)
 
     def test_default_config(self):
         cfg = json.loads((Path(t.SKILL_DIR) / "config.default.json").read_text(encoding="utf-8"))

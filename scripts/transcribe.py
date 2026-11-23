@@ -734,14 +734,22 @@ def _read_last_line_as_is_or_empty(f) -> str:
 def _moved_target(last_line: str) -> tuple[str | None, str]:
     """標準出力の最後の空でない行（そのままの行）が moved: の行なら、(使える移り先, ランチャーに出す行) を返す（#20）。
 
-    - moved: の行でなければ (None, "")（コマンドは md を動かしていない。今までと同じ）
+    - moved: は行の頭だけ見る。その前の見えない字（BOM・ゼロ幅の空白・BEL など、印字できない字）は外す
+    - moved: の行でなければ (None, "")（コマンドは md を動かしていない。今までと同じ）。ただし、見えない字を落とすと
+      moved: の行に見えるもの（UTF-16 で出した行など。要点には moved: と出る）は、黙らずに WARN の行にする（PR #21 のレビュー 1 回目の任意 1）
     - 後ろが絶対パス（Windows ではドライブか UNC から）で、そこにファイルがあれば (正規化した絶対パス, MOVED_HEAD + パス)
     - 使えなければ (None, WARN の行)。理由とパスを添える（印字できない字を落とし、空白をまとめて 200 字で切る）
     例外を送り出さない（run_on_complete_result の「例外を送り出さない」を守る）。
     """
-    if not last_line.startswith(ON_COMPLETE_MOVED_MARK):
+    head = last_line
+    while head and (not head[0].isprintable() or head[0].isspace()):
+        head = head[1:]
+    if not head.startswith(ON_COMPLETE_MOVED_MARK):
+        if _printable(last_line).strip().startswith(ON_COMPLETE_MOVED_MARK):
+            problem = f"印字できない字が混じっています: {_printable(last_line).strip()[len(ON_COMPLETE_MOVED_MARK):].strip()}"
+            return None, f"{ON_COMPLETE_WARN_HEAD}{ON_COMPLETE_MOVED_UNUSABLE}（{one_line(problem, ON_COMPLETE_TAIL_MAX_CHARS)}）"
         return None, ""
-    raw = last_line[len(ON_COMPLETE_MOVED_MARK):].strip()
+    raw = head[len(ON_COMPLETE_MOVED_MARK):].strip()
     try:
         if not raw:
             problem = "パスがありません"

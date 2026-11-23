@@ -492,6 +492,14 @@ class OnCompleteContractTest(unittest.TestCase):
         self.assertEqual(result.line, line)
         self.assertEqual(result.moved_to, os.path.abspath(dest))
         self.assertEqual(result.moved_line, MOVED_HEAD + os.path.abspath(dest))
+        # moved_to は正規化した絶対パス (/ 区切りや .. で書いても。PR #21 のレビュー 1 回目の推奨 1)
+        written = str(self.dir / "保管" / "下" / ".." / "合成  の 記録.md").replace("\\", "/")
+        cmd = self.script("say.py", f"print('moved: ' + {written!r})\n")
+        line, result = self.run_both(cmd, 30)
+        self.assertEqual(result.moved_to, os.path.abspath(dest))
+        # 行の途中の moved: は読まない
+        line, result = self.run_both(self.script("mid.py", f"print('済みました moved: ' + {str(dest)!r})\n"), 30)
+        self.assertEqual((result.moved_to, result.moved_line), (None, ""))
 
     def test_unusable_moved_line_is_a_warning_and_still_ok(self):
         cmd = self.script("lie.py", f"print('moved: ' + {str(self.dir / '無い.md')!r})\n")
