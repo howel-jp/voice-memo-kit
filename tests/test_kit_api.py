@@ -32,6 +32,7 @@ import inspect
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import types
@@ -329,6 +330,97 @@ class OnCompleteContractTest(unittest.TestCase):
         self.assertEqual((result.ok, result.started, result.timed_out, result.exit_code), (False, True, False, None))
         self.assertTrue(result.line.startswith(WARN_HEAD), result.line)
         self.assertIn("合成の待ちの誤り", result.line)
+
+    def popen_whose_wait_fails(self, *errors):
+        """md を最後の引数にした子の wait だけ、errors (例外を作る関数) の順に例外を出す Popen。尽きたら、いつも最後のもの。
+
+        本物の子を起こし、本物の _stop_process_tree で止める (taskkill の wait は本物のまま)。起こした子は instances に残る。
+        errors が無ければ、wait は本物のまま (起こした子を instances に残すためだけに使う)。
+        """
+        md = os.path.abspath(self.md)
+        instances = []
+
+        class P(subprocess.Popen):
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                self.waits = 0
+                if isinstance(self.args, list) and self.args and self.args[-1] == md:
+                    instances.append(self)
+
+            def wait(self, timeout=None):
+                if errors and self in instances:
+                    self.waits += 1
+                    raise errors[min(self.waits, len(errors)) - 1]()
+                return super().wait(timeout)
+
+        return P, instances
+
+    def assert_stopped(self, instances):
+        self.assertTrue(instances)
+        for p in instances:
+            self.assertIsNotNone(p.poll(), "子が残っている")  # poll は上の wait を通らない
+
+    def test_waiting_keeps_failing_with_the_real_stop(self):
+        # 待つ所がいつも例外を出す (止める所の wait も同じ例外)。外へ送り出さない (PR #19 のレビュー 2 回目の必須 1、試し A)
+        P, instances = self.popen_whose_wait_fails(lambda: OSError("合成の待ちの誤り"))
+        cmd = self.script("sleep.py", "import time\ntime.sleep(30)\n")
+        with mock.patch.object(transcribe.subprocess, "Popen", P):
+            line = transcribe.run_on_complete(self.md, cmd, 30, self.project)
+            result = transcribe.run_on_complete_result(self.md, cmd, 30, self.project)
+        self.assert_stopped(instances)
+        self.assertEqual(result.line, line)
+        self.assertTrue(line.startswith(WARN_HEAD), line)
+        self.assertIn("合成の待ちの誤り", line)
+        self.assertEqual((result.ok, result.started, result.timed_out, result.exit_code), (False, True, False, None))
+
+    def test_stop_fails_after_the_timeout(self):
+        # 時間切れの後、止める所の wait が例外を出す。時間切れの行で返す (同、試し C)
+        P, instances = self.popen_whose_wait_fails(lambda: subprocess.TimeoutExpired("合成", 1),
+                                                   lambda: OSError("合成の止めの誤り"))
+        cmd = self.script("sleep.py", 'import time\nprint("眠ります", flush=True)\ntime.sleep(30)\n')
+        with mock.patch.object(transcribe.subprocess, "Popen", P):
+            line = transcribe.run_on_complete(self.md, cmd, 1, self.project)
+            result = transcribe.run_on_complete_result(self.md, cmd, 1, self.project)
+        self.assert_stopped(instances)
+        for got in (line, result.line):
+            self.assertTrue(got.startswith(WARN_HEAD), got)
+            self.assertIn(transcribe.ON_COMPLETE_TIMED_OUT, got)
+        self.assertEqual((result.ok, result.started, result.timed_out, result.exit_code), (False, True, True, None))
+
+    def test_stop_itself_raising_is_not_sent_out(self):
+        # 止める所そのものが例外を出しても (時間切れの道・待つ途中の例外の道)、行を返す
+        cmd = self.script("short.py", "import time\ntime.sleep(2)\n")  # 止められないので、2 秒で自分で終わる子
+        cases = ((1, (), True), (30, (lambda: OSError("合成の待ちの誤り"),), False))
+        for timeout, wait_errors, timed_out in cases:
+            with self.subTest(timed_out=timed_out):
+                P, instances = self.popen_whose_wait_fails(*wait_errors)
+                try:
+                    with mock.patch.object(transcribe, "_stop_process_tree",
+                                           side_effect=RuntimeError("合成の止めの誤り")), \
+                            mock.patch.object(transcribe.subprocess, "Popen", P):
+                        result = transcribe.run_on_complete_result(self.md, cmd, timeout, self.project)
+                finally:
+                    for p in instances:  # 子が自分で終わるのを、本物の wait で待つ (作業フォルダを掴んだまま後始末しない)
+                        subprocess.Popen.wait(p, 30)
+                self.assertTrue(result.line.startswith(WARN_HEAD), result.line)
+                self.assertEqual((result.started, result.timed_out, result.exit_code), (True, timed_out, None))
+
+    def test_stderr_tail_is_read_even_if_stdout_cannot_be(self):
+        # 要点は 1 つずつ読む。標準出力を読めなくても、標準エラー出力の要点は残る (同、任意 1)
+        real = transcribe._read_last_line
+        calls = []
+
+        def first_fails(f):
+            calls.append(f)
+            if len(calls) == 1:
+                raise OSError("合成の読めない")
+            return real(f)
+
+        cmd = self.script("fail.py", 'import sys\nprint("合成の出力")\nsys.stderr.write("合成の失敗\\n")\nsys.exit(3)\n')
+        with mock.patch.object(transcribe, "_read_last_line", side_effect=first_fails):
+            result = transcribe.run_on_complete_result(self.md, cmd, 30, self.project)
+        self.assertIn("exit 3: 合成の失敗", result.line)
+        self.assertEqual((result.started, result.exit_code), (True, 3))
 
     def test_truth_value_is_not_the_outcome(self):
         # 成否は ok で読む。値そのものの真偽は、失敗でも真 (README に書いた。PR #19 のレビュー 1 回目の任意 1)

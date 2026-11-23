@@ -682,24 +682,36 @@ def _read_last_line(f) -> str:
     return ""
 
 
+def _read_last_line_or_empty(f) -> str:
+    """_read_last_line と同じ。読めなければ空（要点を付けない。標準出力と標準エラー出力を 1 つずつ受ける。
+    PR #19 のレビュー 2 回目の任意 1）。"""
+    try:
+        return _read_last_line(f)
+    except Exception:
+        return ""
+
+
 def _stop_process_tree(proc: subprocess.Popen) -> None:
-    """起こしたプロセスとその子孫を止める。Windows は taskkill /T /F、止められなければ（Windows 以外も）kill()。"""
+    """起こしたプロセスとその子孫を止める。Windows は taskkill /T /F、止められなければ（Windows 以外も）kill()。
+
+    例外を送り出さない（止められなくても戻る。run_on_complete の「例外を送り出さない」を守る。PR #19 のレビュー 2 回目の必須 1）。
+    """
     if os.name == "nt":
         # PATH やカレントの taskkill.exe を拾わないように、System32 のものを名指す
         taskkill = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "taskkill.exe")
         try:
             subprocess.run([taskkill, "/T", "/F", "/PID", str(proc.pid)], stdin=subprocess.DEVNULL,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
-        except (OSError, subprocess.SubprocessError):
-            pass
-    if proc.poll() is None:
-        try:
-            proc.kill()
-        except OSError:
+        except Exception:
             pass
     try:
+        if proc.poll() is None:
+            proc.kill()
+    except Exception:
+        pass
+    try:
         proc.wait(timeout=30)
-    except subprocess.TimeoutExpired:
+    except Exception:  # 止まらない（TimeoutExpired）・待てない（OSError など）
         pass
 
 
@@ -762,20 +774,23 @@ def run_on_complete_result(md_path: Path, command: list[str], timeout: float, pr
             try:
                 code = proc.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
+                timed_out = True  # 止める前に立てる（止める所で何が起きても、時間切れの行にする。PR #19 のレビュー 2 回目の必須 1）
                 _stop_process_tree(proc)
-                timed_out = True
-            tail_out = _read_last_line(out)
-            tail_err = _read_last_line(err)
-    except Exception as e:  # 一時ファイルが作れない・出力を読めないなど。文字起こしは失敗にしない
+            tail_out = _read_last_line_or_empty(out)
+            tail_err = _read_last_line_or_empty(err)
+    except Exception as e:  # 一時ファイルが作れない・閉じられないなど。文字起こしは失敗にしない
         if proc is None:
             return cannot_start(f"{type(e).__name__}: {e}")
         if code is None and not timed_out:
             # 起こした後、終わりを待つ途中の例外。子が残らないように止め、終わりの値なしの失敗として返す
-            _stop_process_tree(proc)
+            try:
+                _stop_process_tree(proc)
+            except Exception:  # 止められなくても行を返す（例外を送り出さない）
+                pass
             line = (f"{ON_COMPLETE_WARN_HEAD}{ON_COMPLETE_FAILED}"
                     f"（{one_line(f'{type(e).__name__}: {e}', ON_COMPLETE_TAIL_MAX_CHARS)}）。{ON_COMPLETE_DONE_NOTE}")
             return OnCompleteResult(line=line, started=True, timed_out=False, exit_code=None)
-        # 終わりの値（か時間切れ）は分かっている。出力の要点を読めなかっただけなので、読めた分で下の行にする
+        # 終わりの値（か時間切れ）は分かっている。読めた分の要点で、下の行にする
 
     if timed_out:
         tail = tail_err or tail_out
