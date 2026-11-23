@@ -19,6 +19,10 @@ meeting-transcript・clip-shorts (git の外のユーザースキル) は、こ�
 - PR #19 のレビュー 1 回目への対応で足したもの: load_config の戻りに、config.json のキットの知らない最上位の項が残り、
   whisper の 5 つの鍵があること。run_on_complete が md の絶対パスを最後の引数にし、作業フォルダを project_root にすること。
   started は起こした後の例外でも True であること。候補の環境変数の展開。差し替えは置き換え (既定とは重ならない) であること
+- run_on_complete_result の項 moved_to・moved_line (#20。0.10.0 から): コマンドが通り、標準出力の最後の空でない行が
+  「moved: <絶対パス>」で、そこにファイルがあれば、moved_to はその絶対パス、moved_line は「[E] md の移り先: 」+ moved_to。
+  使えない moved: の行なら moved_to は None で moved_line は「  [WARN] 」で始まる。moved: の行が無い・通らなかったときは None と空。
+  line (run_on_complete の 1 行) は、moved: の行があっても今までと同じ
 
 あわせて、`import transcribe` (meeting-transcript がする) が、プロセスの起動・外部への接続・
 重い import (torch・whisperx など) をしないことを確かめる。GPU・WhisperX・Claude CLI 無しで動く。
@@ -77,6 +81,8 @@ EXPECTED = {
 # run_on_complete の行の頭 (#18)。使う側はこの文字のまま読むので、キットの定数ではなく文字で書く
 OK_HEAD = "[E] 終わりの知らせ: exit 0"
 WARN_HEAD = "  [WARN] "
+MOVED_MARK = "moved:"  # コマンドが md を動かしたときに、標準出力の最後の空でない行に出すもの (#20)
+MOVED_HEAD = "[E] md の移り先: "  # キットが出す移り先の行の頭 (#20)
 PY = sys.executable
 
 
@@ -263,11 +269,21 @@ class OnCompleteContractTest(unittest.TestCase):
         result = transcribe.run_on_complete_result(self.md, command, timeout, self.project)
         self.assertIsInstance(line, str)
         self.assertNotIn("\n", line)
-        self.assertEqual({f.name for f in dataclasses.fields(result)}, {"line", "started", "timed_out", "exit_code"})
+        self.assertEqual({f.name for f in dataclasses.fields(result)},
+                         {"line", "started", "timed_out", "exit_code", "moved_to", "moved_line"})
         self.assertIsInstance(result.line, str)
         self.assertIsInstance(result.started, bool)
         self.assertIsInstance(result.timed_out, bool)
         self.assertIsInstance(result.ok, bool)
+        self.assertIsInstance(result.moved_line, str)
+        # 移り先は、通ったときだけ。moved_to があれば行は移り先の頭、無ければ空か WARN の頭 (#20)
+        if result.moved_to is not None:
+            self.assertTrue(result.ok)
+            self.assertEqual(result.moved_line, MOVED_HEAD + result.moved_to)
+        else:
+            self.assertTrue(result.moved_line == "" or result.moved_line.startswith(WARN_HEAD), result.moved_line)
+        if not result.ok:
+            self.assertEqual((result.moved_to, result.moved_line), (None, ""))
         # 使う側の読み方 (成功の頭で始まるときだけ通った) と、値の ok が合う
         self.assertEqual(result.ok, result.line.startswith(OK_HEAD))
         self.assertEqual(line.startswith(OK_HEAD), result.ok)
@@ -459,6 +475,43 @@ class OnCompleteContractTest(unittest.TestCase):
     def test_line_heads_are_the_kits(self):
         # キットの定数が、約束の文字と同じ (定数を変えたら、ここで止まる)
         self.assertEqual((transcribe.ON_COMPLETE_OK_HEAD, transcribe.ON_COMPLETE_WARN_HEAD), (OK_HEAD, WARN_HEAD))
+        self.assertEqual((transcribe.ON_COMPLETE_MOVED_MARK, transcribe.ON_COMPLETE_MOVED_HEAD), (MOVED_MARK, MOVED_HEAD))
+
+    def test_moved_to(self):
+        # コマンドが md を動かし、標準出力の最後の空でない行を「moved: <絶対パス>」にして通ったとき (#20。0.10.0 から)。
+        # 行 (line) は今までと同じで、移り先は moved_to と moved_line に出る
+        # (run_both は 2 回起こすので、子は動かさずに写す。キットが確かめるのは、移り先にファイルがあることだけ)
+        dest = self.dir / "保管" / "合成  の 記録.md"
+        cmd = self.script("copy.py", "import os, shutil, sys\n"
+                                     "os.makedirs(os.path.dirname(sys.argv[1]), exist_ok=True)\n"
+                                     "shutil.copyfile(sys.argv[-1], sys.argv[1])\n"
+                                     "print('写しました')\n"
+                                     "print('moved: ' + sys.argv[1])\n")
+        line, result = self.run_both(cmd + [str(dest)], 30)
+        self.assertEqual(line, f"{OK_HEAD}（moved: {' '.join(str(dest).split())}）")  # 行の要点は今までどおり
+        self.assertEqual(result.line, line)
+        self.assertEqual(result.moved_to, os.path.abspath(dest))
+        self.assertEqual(result.moved_line, MOVED_HEAD + os.path.abspath(dest))
+        # moved_to は正規化した絶対パス (/ 区切りや .. で書いても。PR #21 のレビュー 1 回目の推奨 1)
+        written = str(self.dir / "保管" / "下" / ".." / "合成  の 記録.md").replace("\\", "/")
+        cmd = self.script("say.py", f"print('moved: ' + {written!r})\n")
+        line, result = self.run_both(cmd, 30)
+        self.assertEqual(result.moved_to, os.path.abspath(dest))
+        # 行の途中の moved: は読まない
+        line, result = self.run_both(self.script("mid.py", f"print('済みました moved: ' + {str(dest)!r})\n"), 30)
+        self.assertEqual((result.moved_to, result.moved_line), (None, ""))
+
+    def test_unusable_moved_line_is_a_warning_and_still_ok(self):
+        cmd = self.script("lie.py", f"print('moved: ' + {str(self.dir / '無い.md')!r})\n")
+        line, result = self.run_both(cmd, 30)
+        self.assertTrue(result.ok)
+        self.assertTrue(line.startswith(OK_HEAD), line)
+        self.assertIsNone(result.moved_to)
+        self.assertTrue(result.moved_line.startswith(WARN_HEAD), result.moved_line)
+
+    def test_no_moved_line_without_the_mark(self):
+        line, result = self.run_both(self.script("say.py", "print('受け取りました')\n"), 30)
+        self.assertEqual((result.moved_to, result.moved_line), (None, ""))
 
 
 class ResolvePathsSwapTest(unittest.TestCase):

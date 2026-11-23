@@ -25,7 +25,9 @@
   （config の output_root の候補がこの PC にあれば、その根の下。どれも無ければ根を作らずに既定の置き場。#14）
 - 退避: 音声が見つかった層の processed/（プロジェクト層は、output_root があればその根の下）
 - 終わりの知らせ: config の on_complete.command があれば、md を書いて音声を退かした後に、
-  md の絶対パスを最後の引数にして、シェルを通さずに起こす（1 md に 1 回。#16）
+  md の絶対パスを最後の引数にして、シェルを通さずに起こす（1 md に 1 回。#16）。
+  コマンドが md を動かし、標準出力の最後の空でない行を moved: <絶対パス> にして exit 0 で終われば、
+  そこにファイルがあるかを確かめて [E] md の移り先: <絶対パス> の行を出す（#20）
 --no-global でグローバル層を無視。
 """
 from __future__ import annotations
@@ -98,6 +100,12 @@ ON_COMPLETE_DONE_NOTE = "文字起こしは済んでいます"
 # ほかのスキルは、成否をこの頭で読んでいる（0.8.0 から）。ほかのスキルとの約束（tests/test_kit_api.py。#18）
 ON_COMPLETE_OK_HEAD = "[E] 終わりの知らせ: exit 0"
 ON_COMPLETE_WARN_HEAD = "  [WARN] "
+# md の移り先（#20）。コマンドが md を動かしたら、標準出力の最後の空でない行を「moved: <絶対パス>」にして exit 0 で終わる。
+# キットは、そこにファイルがあれば MOVED_HEAD <絶対パス> の行（: の後ろはパスだけ）を、使えなければ WARN_HEAD + MOVED_UNUSABLE の行を出す。
+# 音声を退かした行（  moved: <パス>）と見分けるため、キットの行は moved: と書かない
+ON_COMPLETE_MOVED_MARK = "moved:"
+ON_COMPLETE_MOVED_HEAD = "[E] md の移り先: "
+ON_COMPLETE_MOVED_UNUSABLE = "md の移り先（moved: の行）を使えません"
 ON_COMPLETE_EXE_ONLY = ("起こすのは実行ファイル（.exe）だけです。cmd・.bat・.cmd は md のパスの & % ^ をコマンドとして読みうるため。"
                         "node・python・powershell -File などを最初に書きます")
 ON_COMPLETE_EXE_ABSOLUTE = ("実行ファイル（.exe）の絶対パスを書きます。cmd・.bat・.cmd は md のパスの & % ^ を"
@@ -662,10 +670,17 @@ def _decode_output(data: bytes) -> str:
         return data.decode(enc, errors="replace")
 
 
-def _read_last_line(f) -> str:
-    """一時ファイルに受けた出力の、最後の空でない行（1 行）。
+def _printable(text: str) -> str:
+    """印字できない字を落とす（タブなどの空白は空白にする）。"""
+    return "".join(ch if ch.isprintable() else (" " if ch.isspace() else "") for ch in text)
 
-    色などの印を外し、印字できない字を落とし（タブなどの空白は空白にする）、空白をまとめて切る。
+
+def _last_non_empty_line(f) -> tuple[str, str]:
+    """一時ファイルに受けた出力の、最後の空でない行を (印字できる形, そのままの形) の組で返す（無ければ ("", "")）。
+
+    どちらも色などの印を外す。
+    - 印字できる形: 印字できない字を落とす（タブなどの空白は空白にする）。空かどうかは、この形が空白だけかで決める
+    - そのままの形: 前後の空白だけを外す。中の空白（全角の空白も）は変えない
     """
     size = f.seek(0, os.SEEK_END)
     start = max(0, size - ON_COMPLETE_READ_TAIL_BYTES)
@@ -675,11 +690,28 @@ def _read_last_line(f) -> str:
         data = data[data.index(b"\n") + 1:]
     # 行ごとに読む（UTF-8 の行とそうでない行が混じっても、最後の行を読み違えない。PR #17 のレビュー 1 回目の任意 2）
     for raw in reversed(data.splitlines()):
-        line = _ANSI_CSI_RE.sub("", _decode_output(raw))
-        line = "".join(ch if ch.isprintable() else (" " if ch.isspace() else "") for ch in line)
+        text = _ANSI_CSI_RE.sub("", _decode_output(raw))
+        line = _printable(text)
         if line.strip():
-            return one_line(line, ON_COMPLETE_TAIL_MAX_CHARS)
-    return ""
+            return line, text.strip()
+    return "", ""
+
+
+def _read_last_line(f) -> str:
+    """一時ファイルに受けた出力の、最後の空でない行の要点（1 行）。
+
+    色などの印を外し、印字できない字を落とし（タブなどの空白は空白にする）、空白をまとめて切る。
+    """
+    return one_line(_last_non_empty_line(f)[0], ON_COMPLETE_TAIL_MAX_CHARS)
+
+
+def _read_last_line_as_is(f) -> str:
+    """一時ファイルに受けた出力の、最後の空でない行（_read_last_line と同じ行）を、色などの印と前後の空白だけを外して返す。
+
+    空白をまとめず、長さで切らない。md の移り先（moved: の行）のパスを、空白が続いても（全角の空白も）・長くても
+    読み違えないため（要点は空白をまとめて 200 字で切る。#20）。
+    """
+    return _last_non_empty_line(f)[1]
 
 
 def _read_last_line_or_empty(f) -> str:
@@ -689,6 +721,49 @@ def _read_last_line_or_empty(f) -> str:
         return _read_last_line(f)
     except Exception:
         return ""
+
+
+def _read_last_line_as_is_or_empty(f) -> str:
+    """_read_last_line_as_is と同じ。読めなければ空（移り先を読まない。#20）。"""
+    try:
+        return _read_last_line_as_is(f)
+    except Exception:
+        return ""
+
+
+def _moved_target(last_line: str) -> tuple[str | None, str]:
+    """標準出力の最後の空でない行（そのままの行）が moved: の行なら、(使える移り先, ランチャーに出す行) を返す（#20）。
+
+    - moved: は行の頭だけ見る。その前の見えない字（BOM・ゼロ幅の空白・BEL など、印字できない字）は外す
+    - moved: の行でなければ (None, "")（コマンドは md を動かしていない。今までと同じ）。ただし、見えない字を落とすと
+      moved: の行に見えるもの（UTF-16 で出した行など。要点には moved: と出る）は、黙らずに WARN の行にする（PR #21 のレビュー 1 回目の任意 1）
+    - 後ろが絶対パス（Windows ではドライブか UNC から）で、そこにファイルがあれば (正規化した絶対パス, MOVED_HEAD + パス)
+    - 使えなければ (None, WARN の行)。理由とパスを添える（印字できない字を落とし、空白をまとめて 200 字で切る）
+    例外を送り出さない（run_on_complete_result の「例外を送り出さない」を守る）。
+    """
+    head = last_line
+    while head and (not head[0].isprintable() or head[0].isspace()):
+        head = head[1:]
+    if not head.startswith(ON_COMPLETE_MOVED_MARK):
+        if _printable(last_line).strip().startswith(ON_COMPLETE_MOVED_MARK):
+            problem = f"印字できない字が混じっています: {_printable(last_line).strip()[len(ON_COMPLETE_MOVED_MARK):].strip()}"
+            return None, f"{ON_COMPLETE_WARN_HEAD}{ON_COMPLETE_MOVED_UNUSABLE}（{one_line(problem, ON_COMPLETE_TAIL_MAX_CHARS)}）"
+        return None, ""
+    raw = head[len(ON_COMPLETE_MOVED_MARK):].strip()
+    try:
+        if not raw:
+            problem = "パスがありません"
+        elif not os.path.isabs(raw) or (os.name == "nt" and not os.path.splitdrive(raw)[0]):
+            # Windows の「\x」「/x」は今のドライブからのパスで、絶対パスではない（Python 3.12 までの isabs は真を返す）
+            problem = f"絶対パスではありません: {raw}"
+        elif not os.path.isfile(raw):
+            problem = f"ファイルがありません: {raw}"
+        else:
+            path = os.path.abspath(raw)
+            return path, ON_COMPLETE_MOVED_HEAD + path
+    except Exception as e:  # 字の誤り（NUL など）。使えない移り先として扱う
+        problem = f"{type(e).__name__}: {raw}"
+    return None, f"{ON_COMPLETE_WARN_HEAD}{ON_COMPLETE_MOVED_UNUSABLE}（{one_line(_printable(problem), ON_COMPLETE_TAIL_MAX_CHARS)}）"
 
 
 def _stop_process_tree(proc: subprocess.Popen) -> None:
@@ -726,11 +801,17 @@ class OnCompleteResult:
     - exit_code: 終わりの値（起こせない・時間切れ・終わりを待つ途中でキットの側に例外が出たときは None）
     - ok: 通ったか（exit_code が 0）。成否は ok で読む。値そのものの真偽（bool(result)）は失敗でも真
       （__bool__ を定めると、`if result:` が ok と started のどちらの意味か読み違えやすいため、定めない）
+    - moved_to: md の移り先（0.10.0 から。#20）。コマンドが exit 0 で終わり、標準出力の最後の空でない行が
+      「moved: <絶対パス>」で、そこにファイルがあったときの、正規化した絶対パス。それ以外は None
+    - moved_line: ランチャーに出す移り先の行（0.10.0 から。#20）。moved_to があれば ON_COMPLETE_MOVED_HEAD + moved_to、
+      moved: の行が使えなければ ON_COMPLETE_WARN_HEAD で始まる行、moved: の行が無ければ空
     """
     line: str
     started: bool
     timed_out: bool
     exit_code: int | None
+    moved_to: str | None = None
+    moved_line: str = ""
 
     @property
     def ok(self) -> bool:
@@ -754,7 +835,7 @@ def run_on_complete_result(md_path: Path, command: list[str], timeout: float, pr
     proc: subprocess.Popen | None = None
     code: int | None = None
     timed_out = False
-    tail_out = tail_err = ""
+    tail_out = tail_err = last_out = ""
     try:
         argv = on_complete_argv(command, md_path, project_root)
         if _unsafe_program(argv[0]):
@@ -778,6 +859,8 @@ def run_on_complete_result(md_path: Path, command: list[str], timeout: float, pr
                 _stop_process_tree(proc)
             tail_out = _read_last_line_or_empty(out)
             tail_err = _read_last_line_or_empty(err)
+            if code == 0:  # md の移り先は、通ったときの標準出力からだけ読む（#20）
+                last_out = _read_last_line_as_is_or_empty(out)
     except Exception as e:  # 一時ファイルが作れない・閉じられないなど。文字起こしは失敗にしない
         if proc is None:
             return cannot_start(f"{type(e).__name__}: {e}")
@@ -803,7 +886,9 @@ def run_on_complete_result(md_path: Path, command: list[str], timeout: float, pr
                 + f"）。{ON_COMPLETE_DONE_NOTE}")
         return OnCompleteResult(line=line, started=True, timed_out=False, exit_code=code)
     line = ON_COMPLETE_OK_HEAD + (f"（{tail_out}）" if tail_out else "")
-    return OnCompleteResult(line=line, started=True, timed_out=False, exit_code=0)
+    moved_to, moved_line = _moved_target(last_out)
+    return OnCompleteResult(line=line, started=True, timed_out=False, exit_code=0,
+                            moved_to=moved_to, moved_line=moved_line)
 
 
 def run_on_complete(md_path: Path, command: list[str], timeout: float, project_root: Path) -> str:
@@ -918,7 +1003,10 @@ def main() -> int:
         done.append(md_path)
         # md を最終の名前で書き、音声を退かした後（#16）。成否で文字起こしを失敗にしない
         if on_complete:
-            print(run_on_complete(md_path, on_complete[0], on_complete[1], project_root))
+            result = run_on_complete_result(md_path, on_complete[0], on_complete[1], project_root)
+            print(result.line)
+            if result.moved_line:  # コマンドが md を動かした（moved: の行）。SKILL.md §3 はこの行のパスを読む（#20）
+                print(result.moved_line)
 
     print(f"\n完了: {len(done)}/{len(inputs)} 件")
     return 0 if done else 1
