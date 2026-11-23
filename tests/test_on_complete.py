@@ -392,6 +392,146 @@ class RunOnCompleteTest(unittest.TestCase):
                 self.assertEqual(t._read_last_line(f), "合成の字")
 
 
+# md を動かして、標準出力の最後の行に「moved: <絶対パス>」を出す子 (#20)。引数: <動かす先のフォルダ> <md>
+MOVER = r'''
+import os, sys
+dest_dir, md = sys.argv[1], sys.argv[-1]
+os.makedirs(dest_dir, exist_ok=True)
+dest = os.path.join(dest_dir, os.path.basename(md))
+os.replace(md, dest)
+print("並べました")
+print("moved: " + dest)
+'''
+
+
+class MovedTest(unittest.TestCase):
+    """md の移り先 (#20): 通ったときの標準出力の最後の空でない行が「moved: <絶対パス>」なら、そこにファイルがあるかを確かめる。"""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.md = _write(self.root / "out" / "2026-01-02_memo.md", "---\n---\n")
+
+    def run_child(self, code: str, *args: str) -> t.OnCompleteResult:
+        script = _write(self.root / "child.py", code)
+        return t.run_on_complete_result(self.md, [PY, "-I", str(script), *args], 30, self.root)
+
+    def run_writer(self, data: bytes, exit_code: int = 0) -> t.OnCompleteResult:
+        """子は、渡したバイト列をそのまま標準出力に書く (字の符号を決めて試す)。"""
+        blob = self.root / "out.bin"
+        blob.write_bytes(data)
+        return self.run_child("import sys\nsys.stdout.buffer.write(open(sys.argv[1], 'rb').read())\n"
+                              f"sys.exit({exit_code})\n", str(blob))
+
+    def assert_moved(self, result: t.OnCompleteResult, dest: Path) -> None:
+        self.assertTrue(result.ok, result.line)
+        self.assertEqual(result.moved_to, os.path.abspath(dest))
+        self.assertEqual(result.moved_line, t.ON_COMPLETE_MOVED_HEAD + os.path.abspath(dest))
+
+    def assert_not_moved(self, result: t.OnCompleteResult) -> None:
+        self.assertEqual((result.moved_to, result.moved_line), (None, ""))
+
+    def assert_unusable(self, result: t.OnCompleteResult, reason: str) -> None:
+        self.assertTrue(result.ok, result.line)
+        self.assertIsNone(result.moved_to)
+        self.assertTrue(result.moved_line.startswith(f"{t.ON_COMPLETE_WARN_HEAD}{t.ON_COMPLETE_MOVED_UNUSABLE}（{reason}"),
+                        result.moved_line)
+        self.assertNotIn("\n", result.moved_line)
+
+    def test_moved_md_is_read_from_the_last_line(self):
+        dest_dir = self.root / "保管"
+        result = self.run_child(MOVER, str(dest_dir))
+        dest = dest_dir / self.md.name
+        self.assertTrue(dest.is_file())
+        self.assertFalse(self.md.exists())
+        self.assert_moved(result, dest)
+        # ランチャーの 1 行は今までどおり (要点は最後の行)
+        self.assertEqual(result.line, f"{t.ON_COMPLETE_OK_HEAD}（moved: {dest}）")
+
+    def test_spaces_in_the_path_are_kept(self):
+        # 要点は空白をまとめるが、移り先は空白を変えずに読む (続く空白・全角の空白。タブは Windows の名前に使えない)
+        dest = _write(self.root / "保管  の\u3000場所" / "合成 \u3000 の  記録.md", "")
+        result = self.run_writer(("moved: " + str(dest) + "\n").encode("utf-8"))
+        self.assert_moved(result, dest)
+        self.assertNotIn("\u3000", result.line)  # 要点の側は、全角の空白も空白 1 つにまとめる (今までどおり)
+
+    def test_long_path_is_not_cut(self):
+        # 要点は 200 字で切るが、移り先は切らない
+        dest_dir = self.root
+        while len(str(dest_dir)) < 200:
+            dest_dir = dest_dir / "合成のフォルダ"
+        dest = _write(dest_dir / "合成の長い名前の記録.md", "")
+        self.assertGreater(len(str(dest)), t.ON_COMPLETE_TAIL_MAX_CHARS)
+        result = self.run_writer(("moved: " + str(dest) + "\n").encode("utf-8"))
+        self.assert_moved(result, dest)
+
+    def test_crlf_colors_and_no_space_after_the_colon(self):
+        dest = _write(self.root / "保管" / "記録.md", "")
+        for data in ((f"moved: {dest}\r\n").encode("utf-8"),
+                     (f"\x1b[32mmoved: {dest}\x1b[0m\n").encode("utf-8"),
+                     (f"moved:{dest}  \n\n  \n").encode("utf-8")):
+            with self.subTest(data=data):
+                self.assert_moved(self.run_writer(data), dest)
+
+    def test_path_in_the_windows_code_page(self):
+        # UTF-8 で読めない行は Windows の既定のコードページで読む (要点と同じ)
+        dest = _write(self.root / "保管" / "合成の記録.md", "")
+        text = "moved: " + str(dest) + "\n"
+        try:
+            ok = os.name == "nt" and text.encode("cp932").decode("mbcs", "replace") == text
+        except UnicodeEncodeError:  # 一時ディレクトリのパスが cp932 で書けない
+            ok = False
+        if not ok:
+            self.skipTest("Windows の既定のコードページが cp932 のときだけ")
+        self.assert_moved(self.run_writer(text.encode("cp932")), dest)
+
+    def test_only_the_last_non_empty_line_of_stdout_counts(self):
+        dest = _write(self.root / "保管" / "記録.md", "")
+        self.assert_not_moved(self.run_writer(f"moved: {dest}\n終わりました\n".encode("utf-8")))
+        self.assert_not_moved(self.run_child(f"import sys\nprint('moved: ' + {str(dest)!r}, file=sys.stderr)\n"))
+        self.assert_not_moved(self.run_writer(f"Moved: {dest}\n".encode("utf-8")))  # 書き方は小文字の moved: だけ
+        self.assert_not_moved(self.run_writer(b""))
+
+    def test_failed_or_timed_out_command_is_not_read(self):
+        dest = _write(self.root / "保管" / "記録.md", "")
+        failed = self.run_writer(f"moved: {dest}\n".encode("utf-8"), exit_code=3)
+        self.assertFalse(failed.ok)
+        self.assert_not_moved(failed)
+        script = _write(self.root / "slow.py", f"import time\nprint('moved: ' + {str(dest)!r}, flush=True)\ntime.sleep(30)\n")
+        slow = t.run_on_complete_result(self.md, [PY, "-I", str(script)], 1, self.root)
+        self.assertTrue(slow.timed_out)
+        self.assert_not_moved(slow)
+
+    def test_unusable_paths_are_warnings(self):
+        missing = self.root / "保管" / "無い.md"
+        self.assert_unusable(self.run_writer(f"moved: {missing}\n".encode("utf-8")), f"ファイルがありません: {missing}")
+        self.assert_unusable(self.run_writer(b"moved: out/2026-01-02_memo.md\n"),
+                             "絶対パスではありません: out/2026-01-02_memo.md")
+        self.assert_unusable(self.run_writer(b"moved:\n"), "パスがありません")
+        self.assert_unusable(self.run_writer(f"moved: {self.root}\n".encode("utf-8")),
+                             f"ファイルがありません: {self.root}")  # フォルダ
+        self.assert_unusable(self.run_writer(f'moved: "{self.md}"\n'.encode("utf-8")), "絶対パスではありません")  # 引用符で囲まない
+        if os.name == "nt":  # 今のドライブからのパス (\x・/x) は、絶対パスとみなさない
+            drive_relative = os.path.splitdrive(os.path.abspath(self.md))[1]
+            self.assert_unusable(self.run_writer(f"moved: {drive_relative}\n".encode("utf-8")),
+                                 f"絶対パスではありません: {drive_relative}")
+
+    def test_the_moved_line_is_one_line_even_for_odd_output(self):
+        result = self.run_writer(b"moved: C:/\x00\x07\xff\n")
+        self.assertTrue(result.ok)
+        self.assertIsNone(result.moved_to)
+        self.assertTrue(result.moved_line.startswith(t.ON_COMPLETE_WARN_HEAD), result.moved_line)
+        for ch in ("\n", "\x00", "\x07"):
+            self.assertNotIn(ch, result.moved_line)
+
+    def test_run_on_complete_line_is_unchanged(self):
+        # ほかのスキルとの約束: run_on_complete は 1 行の str のまま (移り先の行は足さない)
+        script = _write(self.root / "mover.py", MOVER)
+        line = t.run_on_complete(self.md, [PY, "-I", str(script), str(self.root / "保管")], 30, self.root)
+        self.assertEqual(line, f"{t.ON_COMPLETE_OK_HEAD}（moved: {self.root / '保管' / self.md.name}）")
+
+
 class MainOnCompleteTest(unittest.TestCase):
     """main の中で起こす時・回数・出力。process_one は whisperx のスタブで本当に md を書く。"""
 
@@ -501,6 +641,60 @@ class MainOnCompleteTest(unittest.TestCase):
         self.assertIn("a.m4a の処理に失敗", err)
         self.assertIn("完了: 1/2 件", out)
 
+    def test_moved_md_line_follows_the_exit_line(self):
+        # #20: コマンドが md を動かして moved: の行を出すと、exit 0 の行の次に移り先の行が出る (: の後ろはパスだけ)
+        mover = _write(self.base / "mover.py", MOVER)
+        archive = self.base / "保管"
+        self.config({"command": [PY, "-I", str(mover), str(archive)]})
+        code, out, _ = self.main()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.transcripts(), [])  # 置き場からは動いた
+        [dest] = sorted(archive.glob("*.md"))
+        lines = out.splitlines()
+        written = next(ln for ln in lines if ln.startswith("  -> "))
+        self.assertFalse(Path(written[len("  -> "):]).exists())
+        done = f"{t.ON_COMPLETE_OK_HEAD}（moved: {dest}）"
+        moved = f"{t.ON_COMPLETE_MOVED_HEAD}{os.path.abspath(dest)}"
+        audio = f"  moved: {self.project / 'voice_memos' / 'processed' / 'a.m4a'}"  # 音声を退かした行 (前からある行)
+        self.assertEqual([lines.index(x) for x in (written, audio, done, moved)],
+                         sorted(lines.index(x) for x in (written, audio, done, moved)))
+        self.assertEqual(lines.index(moved), lines.index(done) + 1)
+        self.assertEqual(Path(moved[len(t.ON_COMPLETE_MOVED_HEAD):]), dest)
+        self.assertIn("完了: 1/1 件", lines)
+
+    def test_moved_line_per_md(self):
+        (self.inbox / "b.m4a").write_bytes(b"")
+        mover = _write(self.base / "mover.py", MOVER)
+        archive = self.base / "保管"
+        self.config({"command": [PY, "-I", str(mover), str(archive)]})
+        code, out, _ = self.main()
+        self.assertEqual(code, 0)
+        lines = out.splitlines()
+        moved = [ln for ln in lines if ln.startswith(t.ON_COMPLETE_MOVED_HEAD)]
+        self.assertEqual(sorted(Path(ln[len(t.ON_COMPLETE_MOVED_HEAD):]) for ln in moved), sorted(archive.glob("*.md")))
+        self.assertEqual(len(moved), 2)
+        for ln in moved:  # どれも、その音声の exit 0 の行のすぐ後
+            self.assertTrue(lines[lines.index(ln) - 1].startswith(t.ON_COMPLETE_OK_HEAD))
+
+    def test_unusable_moved_line_does_not_fail_the_transcription(self):
+        script = _write(self.base / "lie.py", f"print('moved: ' + {str(self.base / '無い.md')!r})\n")
+        self.config({"command": [PY, "-I", str(script)]})
+        code, out, _ = self.main()
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.transcripts()), 1)  # md は置き場に残っている
+        lines = out.splitlines()
+        warn = f"{t.ON_COMPLETE_WARN_HEAD}{t.ON_COMPLETE_MOVED_UNUSABLE}（ファイルがありません: {self.base / '無い.md'}）"
+        self.assertIn(warn, lines)
+        self.assertTrue(lines[lines.index(warn) - 1].startswith(t.ON_COMPLETE_OK_HEAD))
+        self.assertNotIn(t.ON_COMPLETE_MOVED_HEAD, out)
+        self.assertIn("完了: 1/1 件", lines)
+
+    def test_no_moved_line_without_the_mark(self):
+        self.config({"command": self.hook_command()})
+        _, out, _ = self.main()
+        self.assertNotIn(t.ON_COMPLETE_MOVED_HEAD, out)
+        self.assertNotIn(t.ON_COMPLETE_MOVED_UNUSABLE, out)
+
     def test_failing_command_does_not_fail_the_transcription(self):
         script = _write(self.base / "fail.py", 'import sys\nprint("合成の失敗", file=sys.stderr)\nsys.exit(3)\n')
         self.config({"command": [PY, "-I", str(script)]})
@@ -588,6 +782,26 @@ class DocsTest(unittest.TestCase):
         # PR #17 のレビュー 1 回目の推奨 1
         self.assertIn("[E] 終わりの知らせ: md を書くたびに走らせます", self.skill)
         self.assertIn("対象の数 × 行の上限の秒", self.skill)
+
+    def test_moved_lines_are_the_same_in_code_and_docs(self):
+        # #20: コマンドに出してもらう行、キットが出す移り先の行と WARN の行を、README・SKILL.md がコードと同じ文で書く
+        for doc in (self.readme, self.skill):
+            for text in (t.ON_COMPLETE_MOVED_HEAD.rstrip(), f"[WARN] {t.ON_COMPLETE_MOVED_UNUSABLE}"):
+                with self.subTest(text=text):
+                    self.assertIn(text, doc)
+        self.assertIn(f"`{t.ON_COMPLETE_MOVED_MARK} <新しい絶対パス>`", self.readme)
+        self.assertIn("標準出力の最後の空でない行", self.readme)
+        self.assertNotIn("`/voice-memo` はランチャーの `->` の行の md を読めなくなる", self.readme)  # 0.9.0 までの文
+
+    def test_skill_reads_the_moved_path_and_asks_when_missing(self):
+        # #20: §3 は移り先の行のパスを読み、md が見つからなければ推測で探さず利用者に聞く
+        section3 = self.skill.split("## 3.", 1)[1].split("\n## ", 1)[0]
+        self.assertIn(t.ON_COMPLETE_MOVED_HEAD.rstrip(), section3)
+        self.assertIn("移り先の行のパスを読む", section3)
+        self.assertIn("推測で探し回らず", section3)
+        self.assertIn("利用者に聞く", section3)
+        # §2 の終わりの確かめは、md を動かす設定ではフォルダの数で見ない
+        self.assertIn("フォルダの md の数では見ずに `完了: m/n 件` の行で見る", self.skill)
 
     def test_default_config(self):
         cfg = json.loads((Path(t.SKILL_DIR) / "config.default.json").read_text(encoding="utf-8"))
