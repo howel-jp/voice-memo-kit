@@ -40,6 +40,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 # Windows cp932 で encode できない文字でのクラッシュを防ぐ
@@ -93,6 +94,10 @@ ON_COMPLETE_FAILED = "終わりの知らせのコマンドが失敗しました"
 ON_COMPLETE_TIMED_OUT = "秒で終わらないため止めました"  # 前に「終わりの知らせのコマンドが <上限> 」が付く
 ON_COMPLETE_CANNOT_START = "終わりの知らせのコマンドを起こせません"
 ON_COMPLETE_DONE_NOTE = "文字起こしは済んでいます"
+# 行の頭。成功の行は OK_HEAD、それ以外（失敗・時間切れ・起こせない）は WARN_HEAD で始まる。
+# ほかのスキルは、成否をこの頭で読んでいる（0.8.0 から）。ほかのスキルとの約束（tests/test_kit_api.py。#18）
+ON_COMPLETE_OK_HEAD = "[E] 終わりの知らせ: exit 0"
+ON_COMPLETE_WARN_HEAD = "  [WARN] "
 ON_COMPLETE_EXE_ONLY = ("起こすのは実行ファイル（.exe）だけです。cmd・.bat・.cmd は md のパスの & % ^ をコマンドとして読みうるため。"
                         "node・python・powershell -File などを最初に書きます")
 ON_COMPLETE_EXE_ABSOLUTE = ("実行ファイル（.exe）の絶対パスを書きます。cmd・.bat・.cmd は md のパスの & % ^ を"
@@ -677,37 +682,79 @@ def _read_last_line(f) -> str:
     return ""
 
 
+def _read_last_line_or_empty(f) -> str:
+    """_read_last_line と同じ。読めなければ空（要点を付けない。標準出力と標準エラー出力を 1 つずつ受ける。
+    PR #19 のレビュー 2 回目の任意 1）。"""
+    try:
+        return _read_last_line(f)
+    except Exception:
+        return ""
+
+
 def _stop_process_tree(proc: subprocess.Popen) -> None:
-    """起こしたプロセスとその子孫を止める。Windows は taskkill /T /F、止められなければ（Windows 以外も）kill()。"""
+    """起こしたプロセスとその子孫を止める。Windows は taskkill /T /F、止められなければ（Windows 以外も）kill()。
+
+    例外を送り出さない（止められなくても戻る。run_on_complete の「例外を送り出さない」を守る。PR #19 のレビュー 2 回目の必須 1）。
+    """
     if os.name == "nt":
         # PATH やカレントの taskkill.exe を拾わないように、System32 のものを名指す
         taskkill = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "taskkill.exe")
         try:
             subprocess.run([taskkill, "/T", "/F", "/PID", str(proc.pid)], stdin=subprocess.DEVNULL,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
-        except (OSError, subprocess.SubprocessError):
-            pass
-    if proc.poll() is None:
-        try:
-            proc.kill()
-        except OSError:
+        except Exception:
             pass
     try:
+        if proc.poll() is None:
+            proc.kill()
+    except Exception:
+        pass
+    try:
         proc.wait(timeout=30)
-    except subprocess.TimeoutExpired:
+    except Exception:  # 止まらない（TimeoutExpired）・待てない（OSError など）
         pass
 
 
-def run_on_complete(md_path: Path, command: list[str], timeout: float, project_root: Path) -> str:
-    """書いた md のパスを最後の引数にして command を起こし、ランチャーに出す 1 行を返す（#16）。
+@dataclass(frozen=True)
+class OnCompleteResult:
+    """終わりの知らせのコマンドを 1 回走らせた結果（run_on_complete_result の戻り。#18）。
+
+    - line: ランチャーに出す 1 行（run_on_complete の戻りと同じ）。成功は ON_COMPLETE_OK_HEAD で始まり、
+      それ以外（失敗・時間切れ・起こせない）は ON_COMPLETE_WARN_HEAD で始まる
+    - started: 起こせたか（起こした後にキットの側で例外が出ても True。False なら、コマンドは走っていない）
+    - timed_out: 上限を過ぎて止めたか
+    - exit_code: 終わりの値（起こせない・時間切れ・終わりを待つ途中でキットの側に例外が出たときは None）
+    - ok: 通ったか（exit_code が 0）。成否は ok で読む。値そのものの真偽（bool(result)）は失敗でも真
+      （__bool__ を定めると、`if result:` が ok と started のどちらの意味か読み違えやすいため、定めない）
+    """
+    line: str
+    started: bool
+    timed_out: bool
+    exit_code: int | None
+
+    @property
+    def ok(self) -> bool:
+        """コマンドが通ったか（終わりの値が 0）。"""
+        return self.exit_code == 0
+
+
+def run_on_complete_result(md_path: Path, command: list[str], timeout: float, project_root: Path) -> OnCompleteResult:
+    """書いた md のパスを最後の引数にして command を起こし、成否を値で返す（#16・#18）。
 
     シェルを通さない。cwd はプロジェクトルート。stdin は空。stdout・stderr は一時ファイルに受ける
     （pipe だと、時間切れの後に孫が pipe を持っていたとき返らない。#4 の U5）。
     上限を過ぎたら、起こしたプロセスとその子孫を止める。何が起きても例外を送り出さない（文字起こしを失敗にしない）。
     """
-    def cannot_start(reason: str) -> str:
-        return f"  [WARN] {ON_COMPLETE_CANNOT_START}（{one_line(reason, ON_COMPLETE_TAIL_MAX_CHARS)}）。{ON_COMPLETE_DONE_NOTE}"
+    def cannot_start(reason: str) -> OnCompleteResult:
+        line = (f"{ON_COMPLETE_WARN_HEAD}{ON_COMPLETE_CANNOT_START}（{one_line(reason, ON_COMPLETE_TAIL_MAX_CHARS)}）。"
+                f"{ON_COMPLETE_DONE_NOTE}")
+        return OnCompleteResult(line=line, started=False, timed_out=False, exit_code=None)
 
+    # 起こした後に例外が出ても、started は True のまま（子は走った。PR #19 のレビュー 1 回目の推奨 1）
+    proc: subprocess.Popen | None = None
+    code: int | None = None
+    timed_out = False
+    tail_out = tail_err = ""
     try:
         argv = on_complete_argv(command, md_path, project_root)
         if _unsafe_program(argv[0]):
@@ -726,22 +773,46 @@ def run_on_complete(md_path: Path, command: list[str], timeout: float, project_r
                 return cannot_start(f"{type(e).__name__}: {e}")
             try:
                 code = proc.wait(timeout=timeout)
-                timed_out = False
             except subprocess.TimeoutExpired:
+                timed_out = True  # 止める前に立てる（止める所で何が起きても、時間切れの行にする。PR #19 のレビュー 2 回目の必須 1）
                 _stop_process_tree(proc)
-                code, timed_out = None, True
-            tail_out, tail_err = _read_last_line(out), _read_last_line(err)
-    except Exception as e:  # 一時ファイルが作れないなど。文字起こしは失敗にしない
-        return cannot_start(f"{type(e).__name__}: {e}")
+            tail_out = _read_last_line_or_empty(out)
+            tail_err = _read_last_line_or_empty(err)
+    except Exception as e:  # 一時ファイルが作れない・閉じられないなど。文字起こしは失敗にしない
+        if proc is None:
+            return cannot_start(f"{type(e).__name__}: {e}")
+        if code is None and not timed_out:
+            # 起こした後、終わりを待つ途中の例外。子が残らないように止め、終わりの値なしの失敗として返す
+            try:
+                _stop_process_tree(proc)
+            except Exception:  # 止められなくても行を返す（例外を送り出さない）
+                pass
+            line = (f"{ON_COMPLETE_WARN_HEAD}{ON_COMPLETE_FAILED}"
+                    f"（{one_line(f'{type(e).__name__}: {e}', ON_COMPLETE_TAIL_MAX_CHARS)}）。{ON_COMPLETE_DONE_NOTE}")
+            return OnCompleteResult(line=line, started=True, timed_out=False, exit_code=None)
+        # 終わりの値（か時間切れ）は分かっている。読めた分の要点で、下の行にする
 
     if timed_out:
         tail = tail_err or tail_out
-        return (f"  [WARN] 終わりの知らせのコマンドが {timeout:g} {ON_COMPLETE_TIMED_OUT}"
+        line = (f"{ON_COMPLETE_WARN_HEAD}終わりの知らせのコマンドが {timeout:g} {ON_COMPLETE_TIMED_OUT}"
                 + (f"（{tail}）" if tail else "") + f"。{ON_COMPLETE_DONE_NOTE}")
+        return OnCompleteResult(line=line, started=True, timed_out=True, exit_code=None)
     if code != 0:
         tail = tail_err or tail_out
-        return f"  [WARN] {ON_COMPLETE_FAILED}（exit {code}" + (f": {tail}" if tail else "") + f"）。{ON_COMPLETE_DONE_NOTE}"
-    return "[E] 終わりの知らせ: exit 0" + (f"（{tail_out}）" if tail_out else "")
+        line = (f"{ON_COMPLETE_WARN_HEAD}{ON_COMPLETE_FAILED}（exit {code}" + (f": {tail}" if tail else "")
+                + f"）。{ON_COMPLETE_DONE_NOTE}")
+        return OnCompleteResult(line=line, started=True, timed_out=False, exit_code=code)
+    line = ON_COMPLETE_OK_HEAD + (f"（{tail_out}）" if tail_out else "")
+    return OnCompleteResult(line=line, started=True, timed_out=False, exit_code=0)
+
+
+def run_on_complete(md_path: Path, command: list[str], timeout: float, project_root: Path) -> str:
+    """書いた md のパスを最後の引数にして command を起こし、ランチャーに出す 1 行を返す（#16）。
+
+    動きは run_on_complete_result と同じで、その line を返す。成功の行は ON_COMPLETE_OK_HEAD で始まり、
+    それ以外は ON_COMPLETE_WARN_HEAD で始まる（ほかのスキルとの約束。tests/test_kit_api.py。#18）。
+    """
+    return run_on_complete_result(md_path, command, timeout, project_root).line
 
 
 def main() -> int:
