@@ -240,6 +240,46 @@ md を書き終えたことを、別の道具（記録の repo への取り込�
 `-DataDir` を省略しても、ランチャーは `VOICE_MEMO_PYTHON` → `~/.claude/plugins/data/*voice-memo-kit*/.venv` → `<plugin-root>/.venv` の順に venv を探す。
 Claude Code では `/voice-memo` を打てば、文字起こしから内容の解釈まで一連で行う。
 
+## ほかのスキルとの約束（キットの関数）
+
+ほかのスキル（例: MTG の録音を全文ログにするスキル、動画を切り抜き用に分析するスキル）は、`scripts/` を `sys.path` に足して、キットの関数を import している。
+キットを更新しても使う側が黙って壊れないよう、次のものを約束する（`tests/test_kit_api.py` が、使う側と同じ呼び方で呼んで確かめる）。
+
+- 呼び方（引数の名前・種類）と戻り値の型を変えない。足してよいのは**省略できる引数だけ**
+- `import transcribe` は、プロセスの起動・外部への接続・重い import（torch・whisperx など）をしない
+
+| 関数 | 呼び方 | 戻り値 |
+|---|---|---|
+| `glossary.load_glossary` | `(glossary_dir)`（無いフォルダ・`None` は空） | 語の `list[dict]` |
+| `glossary.merge_glossaries` | `(*layers)`（後の層が優先） | `list[dict]` |
+| `glossary.build_initial_prompt` | `(entries)` | `str`（語が無ければ空） |
+| `glossary.apply_replacements_to_segments` | `(segments, entries)`（入力は書き換えない） | `(segments, log)` の組 |
+| `transcribe.load_config` | `(project_root)` | 設定の `dict`（キットの既定に `voice_memos/config.json` を重ねたもの） |
+| `transcribe.resolve_paths` | `(cfg, project_root)` | パスの `dict`（下の鍵） |
+| `transcribe.load_merged_glossary` | `(paths, use_global)` | `list[dict]` |
+| `engine.get_model` | キーワードだけ: `model_name`・`compute_type`・`language`・`device`・`initial_prompt` | モデル（同じ引数なら使い回す） |
+| `transcribe.on_complete_settings` | `(cfg)`（読むのは `cfg["on_complete"]` だけ） | `(command, 上限の秒)` の組（`list[str]`・`float`）か `None`（無い・空） |
+| `transcribe.run_on_complete` | `(md_path, command, timeout, project_root)` | ランチャーに出す 1 行の `str`（下の行の頭）。例外を送り出さない |
+| `transcribe.run_on_complete_result` | `run_on_complete` と同じ（0.9.0 から） | `OnCompleteResult`（下の項）。例外を送り出さない |
+
+`resolve_paths` の戻りの鍵: `glossary`・`extra_glossary_dirs`・`inbox`・`transcripts`・`processed`・`global_root`・`global_glossary`・`global_inbox`・`global_processed`・`output_root`・`output_root_missing`。
+
+- `output_root` は使う根（無ければ `None`）。`output_root_missing` は、候補はあるのにこの PC にどれも無いとき `True`
+- `cfg["output_root"]` を差し替えて呼ぶと、置き場の根の候補の解決（環境変数の展開・無い候補を飛ばす・根の外を断る）を、ほかの項にも使い回せる:
+  `resolve_paths({**cfg, "output_root": 自分の項}, project_root)`。根があれば `transcripts`・`processed` がその下になり、
+  どれも無ければ根は `None` で、`transcripts`・`processed` は既定のまま。`output_root` の鍵を外した cfg でも呼べる。渡した cfg は書き換えない
+
+終わりの知らせの成否:
+
+- `run_on_complete` の行の頭: 成功（exit 0）の行は `[E] 終わりの知らせ: exit 0` で始まり、それ以外（失敗・時間切れ・起こせない）の行は `  [WARN] `（空白 2 つの後に `[WARN]`）で始まる。
+  0.8.0 向けに書いた使う側は、成功の頭で始まらなければ失敗とみなしている
+- `run_on_complete_result` の項: `line`（`run_on_complete` と同じ 1 行）、`started`（起こせたか）、`timed_out`（上限を過ぎて止めたか）、
+  `exit_code`（終わりの値。起こせない・時間切れは `None`）、`ok`（`exit_code` が 0。行が成功の頭で始まるときと同じ）
+
+設定の誤り: `resolve_paths`・`on_complete_settings` は `ValueError` を送り出す。その文は、設定の項の名前で始まる
+（`output_root.transcripts`・`output_root.processed`・`on_complete`・`on_complete.command`・`on_complete.timeout_sec`）。
+使う側は、頭に自分の項の名前を足して出せる（例: `meeting.on_complete.command は…`）。
+
 ## 開発
 
 ```powershell

@@ -1,10 +1,21 @@
-"""ほかのスキルが import している 7 関数の呼び方と戻り値の型 (#3 §2 の行 7、C6)。
+"""ほかのスキルとの約束: キットの関数の呼び方と戻り値の形 (#3 §2 の行 7、C6。#18 で足した)。
 
-meeting-transcript・clip-shorts (git の外のユーザースキル) は、このキットの次の 7 関数を import している:
-glossary.load_glossary / merge_glossaries / build_initial_prompt / apply_replacements_to_segments、
-transcribe.load_config / resolve_paths / load_merged_glossary、engine.get_model。
+meeting-transcript・clip-shorts (git の外のユーザースキル) は、このキットの関数を import している。約束するのは次の 11 関数:
+- glossary.load_glossary / merge_glossaries / build_initial_prompt / apply_replacements_to_segments
+- transcribe.load_config / resolve_paths / load_merged_glossary
+- engine.get_model
+- transcribe.on_complete_settings / run_on_complete / run_on_complete_result (#18。前の 2 つは 0.8.0 から使われている。
+  result は 0.9.0 から)
 呼び方 (引数の名前・種類) と戻り値の型を変えないことを、同じ呼び方で呼んで確かめる。
 足してよいのは省略できる引数だけ (#3 §4)。
+
+関数のほかに、使う側が頼っている形も約束に入れる (#18):
+- resolve_paths の戻りの output_root・output_root_missing の鍵と、cfg["output_root"] を差し替えて呼ぶ使い方
+  (置き場の根の候補の解決を、ほかの項にも使い回す)。output_root の鍵を外した cfg でも呼べること
+- run_on_complete の行の頭: 成功 (exit 0) は「[E] 終わりの知らせ: exit 0」、それ以外は「  [WARN] 」で始まる
+  (使う側は、成功の頭で始まらなければ失敗とみなす)。run_on_complete_result の項 (line・started・timed_out・exit_code・ok)
+- 設定の誤りの ValueError の文の頭が、設定の項の名前 (output_root.transcripts・on_complete.command など) であること
+  (使う側は、頭に自分の項の名前 (meeting.) を足して出す)
 
 あわせて、`import transcribe` (meeting-transcript がする) が、プロセスの起動・外部への接続・
 重い import (torch・whisperx など) をしないことを確かめる。GPU・WhisperX・Claude CLI 無しで動く。
@@ -12,9 +23,12 @@ transcribe.load_config / resolve_paths / load_merged_glossary、engine.get_model
 from __future__ import annotations
 
 import contextlib
+import copy
+import dataclasses
 import inspect
 import io
 import json
+import os
 import sys
 import tempfile
 import types
@@ -47,7 +61,19 @@ EXPECTED = {
     transcribe.load_merged_glossary: [("paths", POS, False), ("use_global", POS, False)],
     engine.get_model: [("model_name", KW, True), ("compute_type", KW, True), ("language", KW, True),
                        ("device", KW, True), ("initial_prompt", KW, True)],
+    # 0.8.0 (fdeb3d4) の形 (#18)
+    transcribe.on_complete_settings: [("cfg", POS, False)],
+    transcribe.run_on_complete: [("md_path", POS, False), ("command", POS, False), ("timeout", POS, False),
+                                 ("project_root", POS, False)],
+    # 0.9.0 の形 (#18)
+    transcribe.run_on_complete_result: [("md_path", POS, False), ("command", POS, False), ("timeout", POS, False),
+                                        ("project_root", POS, False)],
 }
+
+# run_on_complete の行の頭 (#18)。使う側はこの文字のまま読むので、キットの定数ではなく文字で書く
+OK_HEAD = "[E] 終わりの知らせ: exit 0"
+WARN_HEAD = "  [WARN] "
+PY = sys.executable
 
 
 class SignatureTest(unittest.TestCase):
@@ -133,8 +159,9 @@ class CallStyleTest(unittest.TestCase):
         self.assertIsInstance(paths, dict)
         self.assertIsInstance(entries, list)
         for key in ("glossary", "extra_glossary_dirs", "inbox", "transcripts", "processed", "global_root",
-                    "global_glossary", "global_inbox", "global_processed"):
+                    "global_glossary", "global_inbox", "global_processed", "output_root", "output_root_missing"):
             self.assertIn(key, paths)
+        self.assertEqual((paths["output_root"], paths["output_root_missing"]), (None, False))  # 既定は根なし
 
     def test_engine_get_model(self):
         fake = _FakeWhisperx()
@@ -151,6 +178,177 @@ class CallStyleTest(unittest.TestCase):
             engine.clear_model_cache()
         self.assertIs(model, again)
         self.assertEqual(len(fake.calls), 1)
+
+
+def _first_word(e: Exception) -> str:
+    """誤りの文の頭 (最初の空白まで)。使う側は、ここに自分の項の名前を足して出す。"""
+    return str(e).split(" ", 1)[0]
+
+
+class OnCompleteContractTest(unittest.TestCase):
+    """meeting-transcript と同じ呼び方で、on_complete の関数を呼ぶ (#18)。起こす子は、合成のスクリプトだけ。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        self.project = self.dir / "proj"
+        self.project.mkdir()
+        self.md = self.dir / "out" / "合成 の 記録.md"
+        self.md.parent.mkdir()
+        self.md.write_text("# 合成\n", encoding="utf-8")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def script(self, name: str, body: str) -> list[str]:
+        path = self.dir / name
+        path.write_text(body, encoding="utf-8")
+        return [PY, "-I", str(path)]
+
+    def test_settings_from_the_on_complete_item_only(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            cfg = transcribe.load_config(self.project)
+        self.assertIsNone(transcribe.on_complete_settings(cfg))  # 既定は起こさない
+        self.assertIsNone(transcribe.on_complete_settings({}))
+        self.assertIsNone(transcribe.on_complete_settings({"on_complete": {"command": []}}))
+        # 使う側は、自分の項 (meeting.on_complete) だけを入れた dict を渡す
+        got = transcribe.on_complete_settings({"on_complete": {"command": [PY, "合成.py"], "timeout_sec": 30}})
+        self.assertEqual(got, ([PY, "合成.py"], 30.0))
+        self.assertIsInstance(got, tuple)
+        self.assertIsInstance(got[0], list)
+        self.assertIsInstance(got[1], float)
+        command, timeout = transcribe.on_complete_settings({"on_complete": {"command": [PY]}})
+        self.assertEqual((command, timeout), ([PY], 120.0))  # 上限を書かなければ既定
+        self.assertIsInstance(timeout, float)
+
+    def test_settings_errors_start_with_the_item_name(self):
+        for oc, head in (("node tool.mjs", "on_complete"),
+                         ({"command": "node tool.mjs"}, "on_complete.command"),
+                         ({"command": [PY, ""]}, "on_complete.command"),
+                         ({"command": [PY], "timeout_sec": 0}, "on_complete.timeout_sec"),
+                         ({"command": [PY], "timeout_sec": True}, "on_complete.timeout_sec")):
+            with self.subTest(oc=oc), self.assertRaises(ValueError) as cm:
+                transcribe.on_complete_settings({"on_complete": oc})
+            self.assertEqual(_first_word(cm.exception), head)
+
+    def run_both(self, command: list[str], timeout: float):
+        line = transcribe.run_on_complete(self.md, command, timeout, self.project)
+        result = transcribe.run_on_complete_result(self.md, command, timeout, self.project)
+        self.assertIsInstance(line, str)
+        self.assertNotIn("\n", line)
+        self.assertEqual({f.name for f in dataclasses.fields(result)}, {"line", "started", "timed_out", "exit_code"})
+        self.assertIsInstance(result.line, str)
+        self.assertIsInstance(result.started, bool)
+        self.assertIsInstance(result.timed_out, bool)
+        self.assertIsInstance(result.ok, bool)
+        # 使う側の読み方 (成功の頭で始まるときだけ通った) と、値の ok が合う
+        self.assertEqual(result.ok, result.line.startswith(OK_HEAD))
+        self.assertEqual(line.startswith(OK_HEAD), result.ok)
+        return line, result
+
+    def test_success(self):
+        cmd = self.script("ok.py", 'import sys\nprint("受け取りました")\n')
+        line, result = self.run_both(cmd, 30)
+        self.assertEqual(line, f"{OK_HEAD}（受け取りました）")
+        self.assertEqual(result.line, line)
+        self.assertEqual((result.ok, result.started, result.timed_out, result.exit_code), (True, True, False, 0))
+
+    def test_success_without_output(self):
+        line, result = self.run_both(self.script("quiet.py", "pass\n"), 30)
+        self.assertEqual(line, OK_HEAD)
+        self.assertEqual((result.ok, result.exit_code), (True, 0))
+
+    def test_failure(self):
+        cmd = self.script("fail.py", 'import sys\nsys.stderr.write("合成の失敗\\n")\nsys.exit(3)\n')
+        line, result = self.run_both(cmd, 30)
+        self.assertTrue(line.startswith(WARN_HEAD), line)
+        self.assertFalse(line.startswith(OK_HEAD))
+        self.assertIn("exit 3", line)
+        self.assertEqual(result.line, line)
+        self.assertEqual((result.ok, result.started, result.timed_out, result.exit_code), (False, True, False, 3))
+
+    def test_timeout(self):
+        cmd = self.script("sleep.py", 'import time\nprint("眠ります", flush=True)\ntime.sleep(30)\n')
+        line, result = self.run_both(cmd, 1)
+        for got in (line, result.line):
+            self.assertTrue(got.startswith(WARN_HEAD), got)
+        self.assertEqual((result.ok, result.started, result.timed_out, result.exit_code), (False, True, True, None))
+
+    def test_cannot_start(self):
+        missing = str(self.dir / "無い" / "prog.exe")
+        line, result = self.run_both([missing], 30)
+        self.assertTrue(line.startswith(WARN_HEAD), line)
+        self.assertEqual(result.line, line)
+        self.assertEqual((result.ok, result.started, result.timed_out, result.exit_code), (False, False, False, None))
+
+    def test_line_heads_are_the_kits(self):
+        # キットの定数が、約束の文字と同じ (定数を変えたら、ここで止まる)
+        self.assertEqual((transcribe.ON_COMPLETE_OK_HEAD, transcribe.ON_COMPLETE_WARN_HEAD), (OK_HEAD, WARN_HEAD))
+
+
+class ResolvePathsSwapTest(unittest.TestCase):
+    """cfg["output_root"] を差し替えて resolve_paths を呼ぶ (meeting-transcript が、自分の項に使い回す。#18)。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        self.project = self.dir / "proj"
+        self.project.mkdir()
+        self.place = self.dir / "置き場"
+        self.place.mkdir()
+        self.absent = self.dir / "無い"
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.cfg = transcribe.load_config(self.project)
+        self.base = transcribe.resolve_paths(self.cfg, self.project)
+        self.out = {"candidates": [str(self.absent), str(self.place)], "transcripts": "logs", "processed": "audio"}
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_swapped_root_is_used(self):
+        before_cfg, before_out = copy.deepcopy(self.cfg), copy.deepcopy(self.out)
+        got = transcribe.resolve_paths({**self.cfg, "output_root": self.out}, self.project)
+        self.assertEqual(got["output_root"], self.place)  # ある最初の候補
+        self.assertIs(got["output_root_missing"], False)
+        self.assertEqual((got["transcripts"], got["processed"]), (self.place / "logs", self.place / "audio"))
+        self.assertEqual(got["inbox"], self.base["inbox"])  # ほかの項は変わらない
+        self.assertEqual((self.cfg, self.out), (before_cfg, before_out))  # 渡したものを書き換えない
+
+    def test_no_candidate_on_this_pc(self):
+        got = transcribe.resolve_paths({**self.cfg, "output_root": {**self.out, "candidates": [str(self.absent)]}},
+                                       self.project)
+        self.assertIsNone(got["output_root"])
+        self.assertIs(got["output_root_missing"], True)
+        self.assertEqual((got["transcripts"], got["processed"]), (self.base["transcripts"], self.base["processed"]))
+
+    def test_without_the_output_root_item(self):
+        plain = transcribe.resolve_paths({k: v for k, v in self.cfg.items() if k != "output_root"}, self.project)
+        self.assertEqual((plain["output_root"], plain["output_root_missing"]), (None, False))
+        self.assertEqual((plain["transcripts"], plain["processed"]), (self.base["transcripts"], self.base["processed"]))
+
+    def test_errors_start_with_the_item_name(self):
+        outside = str(self.dir.resolve())
+        for key, bad in (("processed", "../audio"), ("transcripts", outside), ("transcripts", "")):
+            for candidates in ([str(self.place)], [str(self.absent)]):  # 根があってもなくても誤り
+                with self.subTest(key=key, bad=bad, candidates=candidates), self.assertRaises(ValueError) as cm:
+                    transcribe.resolve_paths({**self.cfg, "output_root": {**self.out, key: bad,
+                                                                          "candidates": candidates}}, self.project)
+                self.assertEqual(_first_word(cm.exception), f"output_root.{key}")
+
+
+class DocsTest(unittest.TestCase):
+    """README の「ほかのスキルとの約束」が、約束の全部を挙げている (#18)。"""
+
+    def test_readme_lists_the_contract(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertTrue("\n## ほかのスキルとの約束" in readme, "README に節「ほかのスキルとの約束」が無い")
+        section = readme.split("\n## ほかのスキルとの約束", 1)[1].split("\n## ", 1)[0]
+        for func in EXPECTED:
+            name = f"{func.__module__}.{func.__name__}"
+            self.assertIn(f"`{name}`", section, name)
+        for word in ("output_root_missing", OK_HEAD, "[WARN]", "started", "timed_out", "exit_code", "`ok`",
+                     "on_complete.command", "output_root.processed", "tests/test_kit_api.py", "省略できる引数"):
+            self.assertIn(word, section, word)
 
 
 class ImportSideEffectTest(unittest.TestCase):
