@@ -9,6 +9,7 @@
 - 校閲: Claude Code CLI（サブスクリプション容量内・追加課金なし）。校閲前の文と、辞書の置き換え前の文（置き換えがあったとき）も md 内に保持
 - 出力: `<project>/voice_memos/transcripts/<録音日>_<元ファイル名>.md`（`output_root` で、PC にあるときだけ別のフォルダにできる）
 - 任意: 何の話かの 1 行（`topic`）を Claude が付けて frontmatter に書く（既定は切）
+- 任意: md を書き終えたら、設定したコマンドに md のパスを渡して走らせる（`on_complete`。既定は無し）
 
 📝 紹介記事（入れ方・使い方を順に説明）: [ボイスメモをそのままClaude Codeの指示にするスキル｜note](https://note.com/trinity_nexus/n/n7ac7edfae794)
 
@@ -181,13 +182,51 @@ Whisper（faster-whisper 1.2.1）が使うのは initial_prompt の**後ろ 223 
   Whisper は 1 チャンク（音声を 30 秒までに分けた区切り）に 224 トークン（initial_prompt を使い切ると 221）までしか出せず、超える分は黙って切れる。
   200 トークンを超えたチャンクがあると `[WARN]`。数は文字起こしの文を同じトークナイザで数え直した目安で、Whisper が出したトークンの数とは少し違うことがある。
 
+### 書き終えたらコマンドを走らせる（on_complete）
+
+md を書き終えたことを、別の道具（記録の repo への取り込み、ほかの保管場所への写し、通知など）にすぐ知らせたいときに使う。
+`voice_memos/config.json` に書く（既定は空で、何も起こさない）。パスは作り物:
+
+```json
+{
+  "on_complete": {
+    "command": ["node", "C:/path/to/tool.mjs"],
+    "timeout_sec": 120
+  }
+}
+```
+
+- 走らせる時: 音声 1 つごとに 1 回。md を最終の名前で書き（`.` で始まる一時ファイルの名前を変えた後）、音声を退かした後（`--keep` なら退かさない）。
+  md を書けなかった音声では走らせない。`--list` では走らせない。1 回だけ止めるときは `--no-on-complete`
+- 渡すもの: `command` の後ろに、書いた md の絶対パスを 1 つ足して起こす（上の例なら `node C:/path/to/tool.mjs <md の絶対パス>`）。
+  シェルを通さないので、パスの空白・引用で崩れない
+- `command` は文字列の配列。最初の要素は実行ファイル（`node`・`python`・`powershell` など）で、PATH で引くか、絶対パスで書く。
+  `/`・`\` を含む相対パスはプロジェクトルート基準。作業フォルダ（cwd）はプロジェクトルート。環境変数はそのまま渡し、標準入力は空にする
+- `.bat`・`.cmd` は起こさない。Windows はそれらを cmd.exe に読ませるので、md のパスの `&`・`%`・`^`（音声の名前から来る）がコマンドとして読まれうるため。
+  `npm` などのコマンドも中身は `.cmd` なので、`node` にスクリプトを渡す形にする。PowerShell のスクリプトは `["powershell", "-NoProfile", "-File", "C:/path/to/tool.ps1"]`
+- `timeout_sec`（既定 120）: 1 回の上限の秒。過ぎたら、起こしたプロセスとその子孫を止める（Windows は `taskkill /T /F`）。待つ間、次の音声の処理とランチャーの終わりが遅れる
+- 重ね方は、ほかの設定と同じ（`config.default.json` に `voice_memos/config.json` を重ねる。`command` は丸ごと置き換わる）
+- 形の誤り（`command` が 1 つの文字列・空の文字列を含む、`timeout_sec` が正の数でない など）は、文字起こしの前に `ERROR: 設定の誤り` と出して止まる（`--list` でも）
+- コマンドが失敗しても、時間切れでも、起こせなくても、文字起こしは失敗にしない（終了コードと `完了: m/n 件` の行は変わらない）。ランチャーの出力に 1 行で出る:
+  ```
+  [E] 終わりの知らせ: md を書くたびに走らせます（上限 120 秒）: node C:/path/to/tool.mjs
+  [E] 終わりの知らせ: exit 0（<出力の要点>）
+    [WARN] 終わりの知らせのコマンドが失敗しました（exit 3: <要点>）。文字起こしは済んでいます
+    [WARN] 終わりの知らせのコマンドが 120 秒で終わらないため止めました（<要点>）。文字起こしは済んでいます
+    [WARN] 終わりの知らせのコマンドを起こせません（<理由>）。文字起こしは済んでいます
+  ```
+  1 行目は、設定があるとき、文字起こしの前に 1 回出る。2 行目から下のどれか 1 行が、md ごとに出る。
+  要点は、出力（失敗・時間切れのときは標準エラー出力を先に見る）の最後の空でない行（200 字まで。出力が無ければ付かない）。UTF-8 で読み、読めなければ Windows の既定のコードページで読む
+- md を動かす・名前を変えるコマンドにすると、`/voice-memo` はランチャーの `->` の行の md を読めなくなる（写す・知らせるだけなら困らない）
+- チームで共有する `config.json` に書くと、それを使う全員の PC で、そのコマンドが走る（コマンドが無い PC では `[WARN] … 起こせません` の行が出るだけで、文字起こしは済む）
+
 ## 使い方
 
 ```powershell
 # プロジェクトルートで（<plugin-root> はプラグインのインストール先）
 & "<plugin-root>\transcribe.ps1" -DataDir "<CLAUDE_PLUGIN_DATA>"            # 両 inbox を全部処理
 & "<plugin-root>\transcribe.ps1" -DataDir "<CLAUDE_PLUGIN_DATA>" "memo.m4a" # 指定ファイル
-# オプション: --timestamps / --no-glossary / --no-global / --no-proofread / --no-topic / --keep / --device cpu / --project <dir> / --out-dir <dir>
+# オプション: --timestamps / --no-glossary / --no-global / --no-proofread / --no-topic / --no-on-complete / --keep / --device cpu / --project <dir> / --out-dir <dir>
 # 対象と置き場を見るだけ（文字起こし・移動・フォルダの作成をしない）: --list
 ```
 

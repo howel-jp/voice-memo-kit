@@ -12,6 +12,7 @@
     python transcribe.py --keep                # 処理後に音声を inbox に残す
     python transcribe.py --device cpu          # GPU 不調時の CPU フォールバック
     python transcribe.py --no-topic            # 話題 (topic) を付けない (config で入れたとき)
+    python transcribe.py --no-on-complete      # 終わりの知らせ (on_complete) を 1 回だけ止める
     python transcribe.py --list                # 対象の音声と置き場を出すだけ (何もしない)
 
 設定: config.default.json（キット既定）に <project>/voice_memos/config.json を重ねて上書き。
@@ -23,6 +24,8 @@
 - 出力: <project>/voice_memos/transcripts/<録音日>_<元ファイル名>.md
   （config の output_root の候補がこの PC にあれば、その根の下。どれも無ければ根を作らずに既定の置き場。#14）
 - 退避: 音声が見つかった層の processed/（プロジェクト層は、output_root があればその根の下）
+- 終わりの知らせ: config の on_complete.command があれば、md を書いて音声を退かした後に、
+  md の絶対パスを最後の引数にして、シェルを通さずに起こす（1 md に 1 回。#16）
 --no-global でグローバル層を無視。
 """
 from __future__ import annotations
@@ -30,10 +33,14 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import locale
+import math
 import os
 import re
 import shutil
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 # Windows cp932 で encode できない文字でのクラッシュを防ぐ
@@ -78,6 +85,20 @@ OUTPUT_ROOT_MISSING_WARN_OUT_DIR = ("  [WARN] 置き場の根（output_root.cand
                                     "根は作らずに、音声の退避先は既定の置き場にします（md は --out-dir に出します）")
 # 展開できずに残った環境変数（$VAR・${VAR}・%VAR%）。残った候補は飛ばす
 _UNEXPANDED_VAR_RE = re.compile(r"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|%[A-Za-z_][A-Za-z0-9_]*%")
+
+# 終わりの知らせ（on_complete。#16）。行の決まった部分は README・SKILL.md に同じ文を書く（tests/test_on_complete.py の DocsTest）
+ON_COMPLETE_DEFAULT_TIMEOUT_SEC = 120
+ON_COMPLETE_FAILED = "終わりの知らせのコマンドが失敗しました"
+ON_COMPLETE_TIMED_OUT = "秒で終わらないため止めました"  # 前に「終わりの知らせのコマンドが <上限> 」が付く
+ON_COMPLETE_CANNOT_START = "終わりの知らせのコマンドを起こせません"
+ON_COMPLETE_DONE_NOTE = "文字起こしは済んでいます"
+# 出力の要点（最後の空でない行）の長さの上限と、要点を探すために読む出力の末尾のバイト数
+ON_COMPLETE_TAIL_MAX_CHARS = 200
+ON_COMPLETE_READ_TAIL_BYTES = 64 * 1024
+# Windows が cmd.exe に読ませるもの。md のパスの & % ^（音声の名前から来る）がコマンドとして読まれうるので起こさない
+_BATCH_SUFFIXES = (".bat", ".cmd")
+# 端末の色などの印（ANSI の CSI 列）。出力の要点から外す
+_ANSI_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -542,6 +563,130 @@ def process_one(
     return out_path
 
 
+def on_complete_settings(cfg: dict) -> tuple[list[str], float] | None:
+    """config の on_complete を確かめて (command, 上限の秒) を返す。command が無いか空なら None（起こさない）。
+
+    形の誤りは ValueError（main が「設定の誤り」として、文字起こしの前に止める。output_root と同じ。#16）。
+    """
+    oc = cfg.get("on_complete")
+    if oc is None:
+        return None
+    if not isinstance(oc, dict):
+        raise ValueError('on_complete は {"command": [...], "timeout_sec": 秒} の形にします')
+    command = oc.get("command")
+    if command is None or command == []:
+        return None
+    if not isinstance(command, list) or not all(isinstance(a, str) and a.strip() for a in command):
+        raise ValueError("on_complete.command は、空でない文字列の配列にします（シェルを通さないので、1 つの文字列には書けません）")
+    timeout = oc.get("timeout_sec", ON_COMPLETE_DEFAULT_TIMEOUT_SEC)
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("on_complete.timeout_sec は正の数（秒）にします")
+    return list(command), float(timeout)
+
+
+def on_complete_argv(command: list[str], md_path: Path, project_root: Path) -> list[str]:
+    """起こす引数の列: command + [md の絶対パス]。
+
+    command[0] が区切りを含む相対パスなら、プロジェクトルート基準にする（区切りの無い名前は PATH で引く）。
+    md のパスは os.path.abspath（ジャンクションをたどらない。--out-dir が相対パスでも絶対パスになる）。
+    """
+    exe = command[0]
+    if ("/" in exe or "\\" in exe) and not os.path.isabs(exe):
+        exe = str(project_root / exe)
+    return [exe, *command[1:], os.path.abspath(md_path)]
+
+
+def _decode_output(data: bytes) -> str:
+    """子の出力を読む。UTF-8 で読めなければ、Windows の既定のコードページ（日本語の Windows なら cp932）で読む。
+
+    Windows では mbcs（ANSI コードページ）を使う。Python の UTF-8 モード（PYTHONUTF8=1）でも変わらない。
+    """
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        enc = "mbcs" if os.name == "nt" else (locale.getpreferredencoding(False) or "utf-8")
+        return data.decode(enc, errors="replace")
+
+
+def _read_last_line(f) -> str:
+    """一時ファイルに受けた出力の、最後の空でない行（1 行）。
+
+    色などの印を外し、印字できない字を落とし（タブなどの空白は空白にする）、空白をまとめて切る。
+    """
+    size = f.seek(0, os.SEEK_END)
+    start = max(0, size - ON_COMPLETE_READ_TAIL_BYTES)
+    f.seek(start)
+    data = f.read()
+    if start and b"\n" in data:  # 途中から読んだときは、切れた最初の行を捨てる（UTF-8 の字の途中で切れることもある）
+        data = data[data.index(b"\n") + 1:]
+    for line in reversed(_decode_output(data).splitlines()):
+        line = _ANSI_CSI_RE.sub("", line)
+        line = "".join(ch if ch.isprintable() else (" " if ch.isspace() else "") for ch in line)
+        if line.strip():
+            return one_line(line, ON_COMPLETE_TAIL_MAX_CHARS)
+    return ""
+
+
+def _stop_process_tree(proc: subprocess.Popen) -> None:
+    """起こしたプロセスとその子孫を止める。Windows は taskkill /T /F、止められなければ（Windows 以外も）kill()。"""
+    if os.name == "nt":
+        # PATH やカレントの taskkill.exe を拾わないように、System32 のものを名指す
+        taskkill = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "taskkill.exe")
+        try:
+            subprocess.run([taskkill, "/T", "/F", "/PID", str(proc.pid)], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    if proc.poll() is None:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def run_on_complete(md_path: Path, command: list[str], timeout: float, project_root: Path) -> str:
+    """書いた md のパスを最後の引数にして command を起こし、ランチャーに出す 1 行を返す（#16）。
+
+    シェルを通さない。cwd はプロジェクトルート。stdin は空。stdout・stderr は一時ファイルに受ける
+    （pipe だと、時間切れの後に孫が pipe を持っていたとき返らない。#4 の U5）。
+    上限を過ぎたら、起こしたプロセスとその子孫を止める。何が起きても例外を送り出さない（文字起こしを失敗にしない）。
+    """
+    def cannot_start(reason: str) -> str:
+        return f"  [WARN] {ON_COMPLETE_CANNOT_START}（{one_line(reason, ON_COMPLETE_TAIL_MAX_CHARS)}）。{ON_COMPLETE_DONE_NOTE}"
+
+    try:
+        argv = on_complete_argv(command, md_path, project_root)
+        if argv[0].lower().endswith(_BATCH_SUFFIXES):
+            return cannot_start(".bat・.cmd は起こしません。node・python・powershell -File などの実行ファイルを最初に書きます")
+        with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+            try:
+                proc = subprocess.Popen(argv, cwd=str(project_root), stdin=subprocess.DEVNULL, stdout=out, stderr=err)
+            except OSError as e:  # 無いコマンド・権限など
+                return cannot_start(f"{type(e).__name__}: {e}")
+            try:
+                code = proc.wait(timeout=timeout)
+                timed_out = False
+            except subprocess.TimeoutExpired:
+                _stop_process_tree(proc)
+                code, timed_out = None, True
+            tail_out, tail_err = _read_last_line(out), _read_last_line(err)
+    except Exception as e:  # 一時ファイルが作れないなど。文字起こしは失敗にしない
+        return cannot_start(f"{type(e).__name__}: {e}")
+
+    if timed_out:
+        tail = tail_err or tail_out
+        return (f"  [WARN] 終わりの知らせのコマンドが {timeout:g} {ON_COMPLETE_TIMED_OUT}"
+                + (f"（{tail}）" if tail else "") + f"。{ON_COMPLETE_DONE_NOTE}")
+    if code != 0:
+        tail = tail_err or tail_out
+        return f"  [WARN] {ON_COMPLETE_FAILED}（exit {code}" + (f": {tail}" if tail else "") + f"）。{ON_COMPLETE_DONE_NOTE}"
+    return "[E] 終わりの知らせ: exit 0" + (f"（{tail_out}）" if tail_out else "")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="ボイスメモ ローカル文字起こし")
     parser.add_argument("input", nargs="?", default=None,
@@ -559,6 +704,8 @@ def main() -> int:
     parser.add_argument("--device", choices=["cuda", "cpu"], default=None,
                         help="推論デバイス（省略時は config の whisper.device、既定 cuda）")
     parser.add_argument("--no-topic", action="store_true", help="話題（topic）を付けない（config で入れたとき）")
+    parser.add_argument("--no-on-complete", action="store_true",
+                        help="終わりの知らせ（config の on_complete.command）を起こさない")
     parser.add_argument("--list", action="store_true",
                         help="対象の音声と置き場を出すだけ（文字起こし・移動・フォルダの作成をしない）")
     args = parser.parse_args()
@@ -568,6 +715,7 @@ def main() -> int:
     device = args.device or cfg.get("whisper", {}).get("device", "cuda")
     try:
         paths = resolve_paths(cfg, project_root)
+        on_complete = on_complete_settings(cfg)  # 形の誤りは、--no-on-complete・--list でも止める
     except ValueError as e:
         print(f"ERROR: 設定の誤り: {e}", file=sys.stderr)
         return 1
@@ -615,19 +763,29 @@ def main() -> int:
     n_proj = sum(1 for _, d in inputs if d == paths["processed"])
     print(f"対象 {len(inputs)} 件（project {n_proj} / global {len(inputs) - n_proj}） / "
           f"device={device} / glossary={not args.no_glossary} / proofread={use_proofread} / topic={use_topic}")
+    if args.no_on_complete:
+        on_complete = None
+    if on_complete:
+        print(f"[E] 終わりの知らせ: md を書くたびに走らせます（上限 {on_complete[1]:g} 秒）: "
+              f"{subprocess.list2cmdline(on_complete[0])}")
 
     entries = [] if args.no_glossary else load_merged_glossary(paths, use_global)
 
     done = []
     for audio, processed_dir in inputs:
         try:
-            done.append(process_one(
+            md_path = process_one(
                 audio, cfg=cfg, processed_dir=processed_dir, out_dir=out_dir,
                 entries=entries, with_timestamps=args.timestamps,
                 keep=args.keep, device=device, use_proofread=use_proofread, use_topic=use_topic,
-            ))
+            )
         except Exception as e:
             print(f"[ERROR] {audio.name} の処理に失敗: {e}", file=sys.stderr)
+            continue
+        done.append(md_path)
+        # md を最終の名前で書き、音声を退かした後（#16）。成否で文字起こしを失敗にしない
+        if on_complete:
+            print(run_on_complete(md_path, on_complete[0], on_complete[1], project_root))
 
     print(f"\n完了: {len(done)}/{len(inputs)} 件")
     return 0 if done else 1

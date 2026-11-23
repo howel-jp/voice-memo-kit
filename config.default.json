@@ -36,5 +36,9 @@
     "enabled": false,
     "model": null,
     "max_chars": 30
+  },
+  "on_complete": {
+    "command": [],
+    "timeout_sec": 120
   }
 }
