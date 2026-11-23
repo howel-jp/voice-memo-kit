@@ -223,7 +223,8 @@ md を書き終えたことを、別の道具（記録の repo への取り込�
     [WARN] 終わりの知らせのコマンドを起こせません（<理由>）。文字起こしは済んでいます
   ```
   1 行目は、設定があるとき、文字起こしの前に 1 回出る（`--list` でも出る。走らせはしない）。2 行目から下のどれか 1 行が、md ごとに出る。
-  要点は、出力（失敗・時間切れのときは標準エラー出力を先に見る）の最後の空でない行（200 字まで。出力が無ければ付かない）。行ごとに、UTF-8 で読み、読めなければ Windows の既定のコードページで読む
+  要点は、出力（失敗・時間切れのときは標準エラー出力を先に見る）の最後の空でない行（200 字まで。出力が無ければ付かない）。行ごとに、UTF-8 で読み、読めなければ Windows の既定のコードページで読む。
+  起こした後、終わりを待つ途中でキットの側に例外が出たとき（まれ）は、子を止め、失敗の行の `exit 3: <要点>` の所に例外の型と文が入る
 - md を動かす・名前を変えるコマンドにすると、`/voice-memo` はランチャーの `->` の行の md を読めなくなる（写す・知らせるだけなら困らない）
 - チームで共有する `config.json` に書くと、それを使う全員の PC で、そのコマンドが走る（コマンドが無い PC では `[WARN] … 起こせません` の行が出るだけで、文字起こしは済む）
 
@@ -254,12 +255,12 @@ Claude Code では `/voice-memo` を打てば、文字起こしから内容の�
 | `glossary.merge_glossaries` | `(*layers)`（後の層が優先） | `list[dict]` |
 | `glossary.build_initial_prompt` | `(entries)` | `str`（語が無ければ空） |
 | `glossary.apply_replacements_to_segments` | `(segments, entries)`（入力は書き換えない） | `(segments, log)` の組 |
-| `transcribe.load_config` | `(project_root)` | 設定の `dict`（キットの既定に `voice_memos/config.json` を重ねたもの） |
+| `transcribe.load_config` | `(project_root)` | 設定の `dict`（キットの既定に `voice_memos/config.json` を重ねたもの。dict は中まで重ね、キットの知らない最上位の項（ほかのスキルが自分の設定を書く項）もそのまま残す。`whisper` には `model`・`compute_type`・`language`・`batch_size`・`chunk_size` がある） |
 | `transcribe.resolve_paths` | `(cfg, project_root)` | パスの `dict`（下の鍵） |
 | `transcribe.load_merged_glossary` | `(paths, use_global)` | `list[dict]` |
 | `engine.get_model` | キーワードだけ: `model_name`・`compute_type`・`language`・`device`・`initial_prompt` | モデル（同じ引数なら使い回す） |
 | `transcribe.on_complete_settings` | `(cfg)`（読むのは `cfg["on_complete"]` だけ） | `(command, 上限の秒)` の組（`list[str]`・`float`）か `None`（無い・空） |
-| `transcribe.run_on_complete` | `(md_path, command, timeout, project_root)` | ランチャーに出す 1 行の `str`（下の行の頭）。例外を送り出さない |
+| `transcribe.run_on_complete` | `(md_path, command, timeout, project_root)`。`command` の後ろに md の絶対パスを 1 つ足して最後の引数にし、シェルを通さず、作業フォルダを `project_root` にして起こす（起こし方の全部は上の「書き終えたらコマンドを走らせる」） | ランチャーに出す 1 行の `str`（下の行の頭）。例外を送り出さない |
 | `transcribe.run_on_complete_result` | `run_on_complete` と同じ（0.9.0 から） | `OnCompleteResult`（下の項）。例外を送り出さない |
 
 `resolve_paths` の戻りの鍵: `glossary`・`extra_glossary_dirs`・`inbox`・`transcripts`・`processed`・`global_root`・`global_glossary`・`global_inbox`・`global_processed`・`output_root`・`output_root_missing`。
@@ -267,14 +268,17 @@ Claude Code では `/voice-memo` を打てば、文字起こしから内容の�
 - `output_root` は使う根（無ければ `None`）。`output_root_missing` は、候補はあるのにこの PC にどれも無いとき `True`
 - `cfg["output_root"]` を差し替えて呼ぶと、置き場の根の候補の解決（環境変数の展開・無い候補を飛ばす・根の外を断る）を、ほかの項にも使い回せる:
   `resolve_paths({**cfg, "output_root": 自分の項}, project_root)`。根があれば `transcripts`・`processed` がその下になり、
-  どれも無ければ根は `None` で、`transcripts`・`processed` は既定のまま。`output_root` の鍵を外した cfg でも呼べる。渡した cfg は書き換えない
+  どれも無ければ根は `None` で、`transcripts`・`processed` は既定のまま。`output_root` の鍵を外した cfg でも呼べる（既定の置き場が返る）。渡した cfg は書き換えない
+- 差し替えは置き換えで、既定の `output_root` とは重ならない。`candidates` を書くなら `transcripts`・`processed` も書く（無ければ設定の誤り）
 
 終わりの知らせの成否:
 
 - `run_on_complete` の行の頭: 成功（exit 0）の行は `[E] 終わりの知らせ: exit 0` で始まり、それ以外（失敗・時間切れ・起こせない）の行は `  [WARN] `（空白 2 つの後に `[WARN]`）で始まる。
   0.8.0 向けに書いた使う側は、成功の頭で始まらなければ失敗とみなしている
-- `run_on_complete_result` の項: `line`（`run_on_complete` と同じ 1 行）、`started`（起こせたか）、`timed_out`（上限を過ぎて止めたか）、
-  `exit_code`（終わりの値。起こせない・時間切れは `None`）、`ok`（`exit_code` が 0。行が成功の頭で始まるときと同じ）
+- `run_on_complete_result` の項: `line`（`run_on_complete` と同じ 1 行）、`started`（起こせたか。起こした後にキットの側で例外が出ても `True` で、`False` ならコマンドは走っていない）、
+  `timed_out`（上限を過ぎて止めたか）、`exit_code`（終わりの値。起こせない・時間切れ・終わりを待つ途中でキットの側に例外が出たときは `None`）、
+  `ok`（`exit_code` が 0。行が成功の頭で始まるときと同じ）
+- 成否は `ok` で読む。値そのものの真偽（`if result:`）は、失敗でも真
 
 設定の誤り: `resolve_paths`・`on_complete_settings` は `ValueError` を送り出す。その文は、設定の項の名前で始まる
 （`output_root.transcripts`・`output_root.processed`・`on_complete`・`on_complete.command`・`on_complete.timeout_sec`）。

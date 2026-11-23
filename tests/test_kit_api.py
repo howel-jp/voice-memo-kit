@@ -16,6 +16,9 @@ meeting-transcript・clip-shorts (git の外のユーザースキル) は、こ�
   (使う側は、成功の頭で始まらなければ失敗とみなす)。run_on_complete_result の項 (line・started・timed_out・exit_code・ok)
 - 設定の誤りの ValueError の文の頭が、設定の項の名前 (output_root.transcripts・on_complete.command など) であること
   (使う側は、頭に自分の項の名前 (meeting.) を足して出す)
+- PR #19 のレビュー 1 回目への対応で足したもの: load_config の戻りに、config.json のキットの知らない最上位の項が残り、
+  whisper の 5 つの鍵があること。run_on_complete が md の絶対パスを最後の引数にし、作業フォルダを project_root にすること。
+  started は起こした後の例外でも True であること。候補の環境変数の展開。差し替えは置き換え (既定とは重ならない) であること
 
 あわせて、`import transcribe` (meeting-transcript がする) が、プロセスの起動・外部への接続・
 重い import (torch・whisperx など) をしないことを確かめる。GPU・WhisperX・Claude CLI 無しで動く。
@@ -163,6 +166,29 @@ class CallStyleTest(unittest.TestCase):
             self.assertIn(key, paths)
         self.assertEqual((paths["output_root"], paths["output_root_missing"]), (None, False))  # 既定は根なし
 
+    def test_load_config_keeps_items_the_kit_does_not_know(self):
+        # 使う側は、config.json に自分の項 (meeting) を書いて load_config の戻りから読み、whisper の鍵も読む
+        # (PR #19 のレビュー 1 回目の推奨 2)
+        own = {"output_root": {"candidates": ["."], "transcripts": "合成", "processed": "合成の録音"},
+               "on_complete": {"command": [PY], "timeout_sec": 30}}
+        with tempfile.TemporaryDirectory() as d:
+            project_root = Path(d)
+            (project_root / "voice_memos").mkdir()
+            (project_root / "voice_memos" / "config.json").write_text(
+                json.dumps({"meeting": own, "合成の項": [1, 2], "whisper": {"device": "cpu"}}, ensure_ascii=False),
+                encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()):
+                cfg = transcribe.load_config(project_root)
+                default = transcribe.load_config(project_root / "voice_memos")  # config.json の無いプロジェクト
+        self.assertEqual(cfg["meeting"], own)  # キットの知らない最上位の項は、そのまま残る
+        self.assertEqual(cfg["合成の項"], [1, 2])
+        for w in (cfg["whisper"], default["whisper"]):
+            for key in ("model", "compute_type", "language", "batch_size", "chunk_size"):
+                self.assertIn(key, w)
+        self.assertEqual(cfg["whisper"]["device"], "cpu")  # 書いた鍵だけ変わり、ほかは既定
+        self.assertEqual({k: v for k, v in cfg["whisper"].items() if k != "device"},
+                         {k: v for k, v in default["whisper"].items() if k != "device"})
+
     def test_engine_get_model(self):
         fake = _FakeWhisperx()
         with tempfile.TemporaryDirectory() as d:
@@ -247,11 +273,68 @@ class OnCompleteContractTest(unittest.TestCase):
         return line, result
 
     def test_success(self):
-        cmd = self.script("ok.py", 'import sys\nprint("受け取りました")\n')
+        # 起こし方 (PR #19 のレビュー 1 回目の推奨 3): command の後ろに md の絶対パスを 1 つ足し、作業フォルダは project_root
+        record = self.dir / "record.jsonl"
+        cmd = self.script("ok.py", "import json, os, sys\n"
+                                   "with open(sys.argv[1], 'a', encoding='utf-8') as f:\n"
+                                   "    f.write(json.dumps({'args': sys.argv[1:], 'cwd': os.getcwd()}) + '\\n')\n"
+                                   'print("受け取りました")\n') + [str(record), "合成の引数"]
         line, result = self.run_both(cmd, 30)
         self.assertEqual(line, f"{OK_HEAD}（受け取りました）")
         self.assertEqual(result.line, line)
         self.assertEqual((result.ok, result.started, result.timed_out, result.exit_code), (True, True, False, 0))
+        recs = [json.loads(s) for s in record.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(len(recs), 2)  # run_on_complete と run_on_complete_result で 1 回ずつ
+        for rec in recs:
+            self.assertEqual(rec["args"], [str(record), "合成の引数", os.path.abspath(self.md)])
+            self.assertEqual(Path(rec["cwd"]).resolve(), self.project.resolve())
+
+    def test_relative_md_path_is_passed_as_absolute(self):
+        record = self.dir / "args.txt"
+        cmd = self.script("arg.py", "import sys\nopen(sys.argv[1], 'w', encoding='utf-8').write(sys.argv[-1])\n")
+        here = os.getcwd()
+        os.chdir(self.dir)
+        try:  # 作業フォルダからの相対パスで渡しても
+            result = transcribe.run_on_complete_result(Path("out") / self.md.name, cmd + [str(record)], 30, self.project)
+        finally:
+            os.chdir(here)
+        self.assertTrue(result.ok, result.line)
+        self.assertEqual(record.read_text(encoding="utf-8"), os.path.abspath(self.md))
+
+    def test_started_stays_true_when_the_output_cannot_be_read(self):
+        # 子は走ったのに、出力の要点を読めないとき (PR #19 のレビュー 1 回目の推奨 1)。終わりの値で返し、要点は付けない
+        marker = self.dir / "ran.txt"
+        cmd = self.script("mark.py", "import sys\nopen(sys.argv[1], 'w').write('ran')\nprint('合成')\n") + [str(marker)]
+        with mock.patch.object(transcribe, "_read_last_line", side_effect=OSError("合成の読めない")):
+            result = transcribe.run_on_complete_result(self.md, cmd, 30, self.project)
+        self.assertTrue(marker.is_file())
+        self.assertEqual((result.ok, result.started, result.timed_out, result.exit_code), (True, True, False, 0))
+        self.assertEqual(result.line, OK_HEAD)
+
+    def test_exception_while_waiting_is_a_started_failure(self):
+        # 起こした後、終わりを待つ途中の例外: 子を止め、started は True、終わりの値は None
+        class FakeProc:
+            pid = 0
+
+            def __init__(self, *a, **k):
+                pass
+
+            def wait(self, timeout=None):
+                raise OSError("合成の待ちの誤り")
+
+        with mock.patch.object(transcribe.subprocess, "Popen", FakeProc), \
+                mock.patch.object(transcribe, "_stop_process_tree") as stop:
+            result = transcribe.run_on_complete_result(self.md, [PY], 30, self.project)
+        self.assertEqual(stop.call_count, 1)
+        self.assertEqual((result.ok, result.started, result.timed_out, result.exit_code), (False, True, False, None))
+        self.assertTrue(result.line.startswith(WARN_HEAD), result.line)
+        self.assertIn("合成の待ちの誤り", result.line)
+
+    def test_truth_value_is_not_the_outcome(self):
+        # 成否は ok で読む。値そのものの真偽は、失敗でも真 (README に書いた。PR #19 のレビュー 1 回目の任意 1)
+        result = transcribe.run_on_complete_result(self.md, [str(self.dir / "無い" / "prog.exe")], 30, self.project)
+        self.assertFalse(result.ok)
+        self.assertTrue(bool(result))
 
     def test_success_without_output(self):
         line, result = self.run_both(self.script("quiet.py", "pass\n"), 30)
@@ -322,9 +405,28 @@ class ResolvePathsSwapTest(unittest.TestCase):
         self.assertEqual((got["transcripts"], got["processed"]), (self.base["transcripts"], self.base["processed"]))
 
     def test_without_the_output_root_item(self):
-        plain = transcribe.resolve_paths({k: v for k, v in self.cfg.items() if k != "output_root"}, self.project)
+        # 使う側は、上の段に根がある cfg から鍵を外して、既定の置き場を得る (PR #19 のレビュー 1 回目の任意 3)
+        with_root = {**self.cfg, "output_root": self.out}
+        self.assertEqual(transcribe.resolve_paths(with_root, self.project)["output_root"], self.place)
+        plain = transcribe.resolve_paths({k: v for k, v in with_root.items() if k != "output_root"}, self.project)
         self.assertEqual((plain["output_root"], plain["output_root_missing"]), (None, False))
         self.assertEqual((plain["transcripts"], plain["processed"]), (self.base["transcripts"], self.base["processed"]))
+
+    def test_candidates_with_environment_variables(self):
+        # 候補の解決 (環境変数の展開・展開できない候補を飛ばす) も使い回せる (PR #19 のレビュー 1 回目の推奨 3)
+        forms = ["$VMK_KIT_API_PLACE", "${VMK_KIT_API_PLACE}"] + (["%VMK_KIT_API_PLACE%"] if os.name == "nt" else [])
+        with mock.patch.dict(os.environ, {"VMK_KIT_API_PLACE": str(self.place)}):
+            os.environ.pop("VMK_KIT_API_UNSET", None)
+            for form in forms:
+                with self.subTest(form=form):
+                    got = transcribe.resolve_paths(
+                        {**self.cfg, "output_root": {**self.out, "candidates": ["${VMK_KIT_API_UNSET}", form]}},
+                        self.project)
+                    self.assertEqual(got["output_root"], self.place)
+                    self.assertEqual(got["transcripts"], self.place / "logs")
+            got = transcribe.resolve_paths({**self.cfg, "output_root": {**self.out, "candidates": ["${VMK_KIT_API_UNSET}"]}},
+                                           self.project)
+            self.assertEqual((got["output_root"], got["output_root_missing"]), (None, True))
 
     def test_errors_start_with_the_item_name(self):
         outside = str(self.dir.resolve())
@@ -334,6 +436,14 @@ class ResolvePathsSwapTest(unittest.TestCase):
                     transcribe.resolve_paths({**self.cfg, "output_root": {**self.out, key: bad,
                                                                           "candidates": candidates}}, self.project)
                 self.assertEqual(_first_word(cm.exception), f"output_root.{key}")
+
+    def test_swapped_item_replaces_the_default(self):
+        # 差し替えは置き換えで、既定の output_root とは重ならない。鍵が無ければ誤り (PR #19 のレビュー 1 回目の任意 2)
+        for key in ("transcripts", "processed"):
+            with self.subTest(key=key), self.assertRaises(ValueError) as cm:
+                transcribe.resolve_paths({**self.cfg, "output_root": {k: v for k, v in self.out.items() if k != key}},
+                                         self.project)
+            self.assertEqual(_first_word(cm.exception), f"output_root.{key}")
 
 
 class DocsTest(unittest.TestCase):
@@ -347,7 +457,10 @@ class DocsTest(unittest.TestCase):
             name = f"{func.__module__}.{func.__name__}"
             self.assertIn(f"`{name}`", section, name)
         for word in ("output_root_missing", OK_HEAD, "[WARN]", "started", "timed_out", "exit_code", "`ok`",
-                     "on_complete.command", "output_root.processed", "tests/test_kit_api.py", "省略できる引数"):
+                     "on_complete.command", "output_root.processed", "tests/test_kit_api.py", "省略できる引数",
+                     # PR #19 のレビュー 1 回目への対応で足した約束
+                     "知らない最上位の項", "`chunk_size`", "md の絶対パス", "最後の引数", "作業フォルダを `project_root`",
+                     "差し替えは置き換え", "成否は `ok` で読む"):
             self.assertIn(word, section, word)
 
 
