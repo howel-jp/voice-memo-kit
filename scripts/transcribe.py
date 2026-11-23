@@ -95,6 +95,8 @@ ON_COMPLETE_CANNOT_START = "終わりの知らせのコマンドを起こせま�
 ON_COMPLETE_DONE_NOTE = "文字起こしは済んでいます"
 ON_COMPLETE_EXE_ONLY = ("起こすのは実行ファイル（.exe）だけです。cmd・.bat・.cmd は md のパスの & % ^ をコマンドとして読みうるため。"
                         "node・python・powershell -File などを最初に書きます")
+ON_COMPLETE_EXE_ABSOLUTE = ("実行ファイル（.exe）の絶対パスを書きます。cmd・.bat・.cmd は md のパスの & % ^ を"
+                            "コマンドとして読みうるため")
 # 出力の要点（最後の空でない行）の長さの上限と、要点を探すために読む出力の末尾のバイト数
 ON_COMPLETE_TAIL_MAX_CHARS = 200
 ON_COMPLETE_READ_TAIL_BYTES = 64 * 1024
@@ -709,7 +711,14 @@ def run_on_complete(md_path: Path, command: list[str], timeout: float, project_r
     try:
         argv = on_complete_argv(command, md_path, project_root)
         if _unsafe_program(argv[0]):
-            return cannot_start(f"{os.path.basename(argv[0])} は起こしません。{ON_COMPLETE_EXE_ONLY}")
+            found = os.path.basename(argv[0])
+            bare = "/" not in command[0] and "\\" not in command[0]
+            if bare and found.rstrip(" .").lower() not in _SHELL_NAMES:
+                # 名前だけで書いて、PATH で .bat・.cmd が先に見つかったとき（例: python.bat の shim）。
+                # 書いた名前そのものを勧めない（PR #17 のレビュー 2 回目の任意 1）
+                return cannot_start(f"{command[0]} を PATH で引くと {found} になるため起こしません。"
+                                    f"{ON_COMPLETE_EXE_ABSOLUTE}")
+            return cannot_start(f"{found} は起こしません。{ON_COMPLETE_EXE_ONLY}")
         with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
             try:
                 proc = subprocess.Popen(argv, cwd=str(project_root), stdin=subprocess.DEVNULL, stdout=out, stderr=err)

@@ -327,7 +327,9 @@ class RunOnCompleteTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"PATH": str(bindir)}), mock.patch.object(t.subprocess, "Popen") as popen:
             line = t.run_on_complete(self.md, ["npmlike", "run", "x"], 30, self.root)
         popen.assert_not_called()
-        self.assertIn("npmlike.cmd は起こしません", line)
+        # PR #17 のレビュー 2 回目の任意 1: 書いた名前そのものを勧めず、.exe の絶対パスを勧める
+        self.assertEqual(line, f"  [WARN] {t.ON_COMPLETE_CANNOT_START}（npmlike を PATH で引くと npmlike.cmd になるため"
+                               f"起こしません。{t.ON_COMPLETE_EXE_ABSOLUTE}）。{t.ON_COMPLETE_DONE_NOTE}")
 
     def test_bare_name_is_looked_up_on_path_and_run(self):
         out = self.root / "argv0.txt"
@@ -336,7 +338,9 @@ class RunOnCompleteTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"PATH": str(Path(PY).parent)}):
             line = t.run_on_complete(self.md, [name, "-I", str(script)], 30, self.root)
         self.assertEqual(line, "[E] 終わりの知らせ: exit 0")
-        self.assertTrue(out.exists())
+        # PR #17 のレビュー 2 回目の任意 2: 起きたのは PATH で引いた python (元の名前を CreateProcess に渡すと、
+        # 起こした側の exe のフォルダの python が先に見つかる)
+        self.assertEqual(os.path.normcase(out.read_text(encoding="utf-8")), os.path.normcase(PY))
 
     def test_missing_bare_name_cannot_start(self):
         with mock.patch.dict(os.environ, {"PATH": str(self.root / "empty")}):
